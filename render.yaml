@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: industrial-rag-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: USE_OLLAMA
+        value: "false"
+      - key: ANTHROPIC_API_KEY
+        sync: false   # you paste this manually in Render dashboard
+    disk:
+      name: rag-storage
+      mountPath: /opt/render/project/src/uploads
+      sizeGB: 1
