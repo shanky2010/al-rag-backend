@@ -1,14 +1,14 @@
 """
 IndustrialRAG - FastAPI Backend
-Render-compatible: port binds immediately, model loads after via lifespan.
+Render-compatible: port binds immediately, model loads in background thread.
 """
 
 import os
 import sys
 import shutil
 import pickle
+import threading
 from pathlib import Path
-from contextlib import asynccontextmanager
 
 import numpy as np
 import faiss
@@ -42,22 +42,13 @@ CHUNK_CHARS         = 2400
 OVERLAP_CHARS       = 400
 RELEVANCE_THRESHOLD = 0.35
 
-# ── Globals (set during lifespan, after port is already bound) ──
+# ── Global state ──
 embedder       = None
 index          = None
 metadata_store = {}
 _id_counter    = 0
+_ready         = False   # True once model + index are loaded
 
-# ── OCR fallback ──
-def _ocr_page(page):
-    try:
-        import pytesseract
-        img = page.to_image(resolution=300).original
-        return pytesseract.image_to_string(img)
-    except Exception:
-        return ""
-
-# ── Index helpers ──
 def _make_index():
     return faiss.IndexIDMap(faiss.IndexFlatL2(EMBEDDING_DIM))
 
@@ -77,20 +68,43 @@ def _load_index():
             print(f"Could not load index ({e}). Starting fresh.")
     return _make_index(), {}
 
-# ── Lifespan: runs AFTER uvicorn binds port ──
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global embedder, index, metadata_store, _id_counter
-    print("==> Loading sentence-transformer model (may take 1-2 min on first boot)...")
-    from sentence_transformers import SentenceTransformer
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    print("==> Model loaded. Loading FAISS index...")
-    index, metadata_store = _load_index()
-    _id_counter = max(metadata_store.keys(), default=-1) + 1
-    print(f"==> Ready. {index.ntotal} chunks indexed.")
-    yield
-    print("==> Shutting down.")
+def _background_load():
+    """Runs in a thread — loads model AFTER the HTTP server is already up."""
+    global embedder, index, metadata_store, _id_counter, _ready
+    try:
+        print("==> [background] Loading sentence-transformer model...")
+        from sentence_transformers import SentenceTransformer
+        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        print("==> [background] Model loaded. Loading FAISS index...")
+        index, metadata_store = _load_index()
+        _id_counter = max(metadata_store.keys(), default=-1) + 1
+        _ready = True
+        print(f"==> [background] Ready. {index.ntotal} chunks indexed.")
+    except Exception as e:
+        print(f"==> [background] FATAL during startup: {e}")
 
+# ── App — created immediately, model loads in background ──
+app = FastAPI(title="IndustrialRAG")
+
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
+
+# Start background load as soon as the module is imported by uvicorn
+_loader_thread = threading.Thread(target=_background_load, daemon=True)
+_loader_thread.start()
+
+# ── OCR fallback ──
+def _ocr_page(page):
+    try:
+        import pytesseract
+        img = page.to_image(resolution=300).original
+        return pytesseract.image_to_string(img)
+    except Exception:
+        return ""
+
+# ── Vector store helpers ──
 def _next_id():
     global _id_counter
     v = _id_counter
@@ -137,28 +151,24 @@ def _chunk(text):
     return out
 
 def _retrieve(query, machine, top_manual=5, top_log=3):
-    if index is None or index.ntotal == 0:
+    if not _ready or index.ntotal == 0:
         return []
     q_vec = embedder.encode([query], normalize_embeddings=True)
     k = min(index.ntotal, (top_manual + top_log) * 10)
     distances, ids = index.search(np.array(q_vec, dtype="float32"), k)
     manual, logs = [], []
     for dist, idx in zip(distances[0], ids[0]):
-        if idx < 0 or idx not in metadata_store:
-            continue
+        if idx < 0 or idx not in metadata_store: continue
         score = float(1.0 - dist / 2.0)
-        if score < RELEVANCE_THRESHOLD:
-            continue
+        if score < RELEVANCE_THRESHOLD: continue
         meta = metadata_store[idx]
-        if machine.lower() != "all" and meta.get("machine_name", "").lower() != machine.lower():
-            continue
+        if machine.lower() != "all" and meta.get("machine_name","").lower() != machine.lower(): continue
         row = {**meta, "score": round(score, 3)}
         if meta.get("source") == "repair_log":
             if len(logs) < top_log: logs.append(row)
         else:
             if len(manual) < top_manual: manual.append(row)
-        if len(manual) >= top_manual and len(logs) >= top_log:
-            break
+        if len(manual) >= top_manual and len(logs) >= top_log: break
     return manual + logs
 
 def _get_machines():
@@ -168,36 +178,29 @@ def _get_files():
     files = {}
     for meta in metadata_store.values():
         key = meta.get("source_pdf") or meta.get("source_excel")
-        if not key:
-            continue
+        if not key: continue
         if key not in files:
-            files[key] = {"filename": key, "machine": meta.get("machine_name", ""),
+            files[key] = {"filename": key, "machine": meta.get("machine_name",""),
                           "type": "pdf" if meta.get("source_pdf") else "excel", "chunks": 0}
         files[key]["chunks"] += 1
     return list(files.values())
 
-# ── App — lifespan passed here ──
-app = FastAPI(title="IndustrialRAG", lifespan=lifespan)
+def _require_ready():
+    if not _ready:
+        raise HTTPException(503, "System is still loading (model download). Please wait 1-2 minutes and retry.")
 
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
-app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
+# ── Routes ──
 
-# ── Health (answers immediately, even while model is loading) ──
 @app.get("/health")
 def health():
-    ready = embedder is not None and index is not None
-    return {"status": "ok" if ready else "loading", "chunks_indexed": index.ntotal if index else 0}
+    return {"status": "ok" if _ready else "loading",
+            "chunks_indexed": index.ntotal if _ready else 0}
 
-# ── Upload PDF ──
 @app.post("/admin/upload/pdf")
 async def upload_pdf(file: UploadFile = File(...), machine_name: str = Form(...)):
-    if embedder is None:
-        raise HTTPException(503, "Model still loading, please retry in 30 seconds.")
+    _require_ready()
     machine_name = machine_name.strip()
-    if not machine_name:
-        raise HTTPException(400, "machine_name required")
+    if not machine_name: raise HTTPException(400, "machine_name required")
     filename = f"{machine_name.replace(' ','_')}_{file.filename}"
     filepath = PDF_DIR / filename
     data = await file.read()
@@ -210,8 +213,7 @@ async def upload_pdf(file: UploadFile = File(...), machine_name: str = Form(...)
                 page_text = (page.extract_text() or "").strip()
                 if not page_text:
                     page_text = _ocr_page(page).strip()
-                if not page_text:
-                    continue
+                if not page_text: continue
                 for chunk in _chunk(page_text):
                     texts.append(chunk)
                     metas.append({"machine_name": machine_name, "source_pdf": filename,
@@ -226,14 +228,11 @@ async def upload_pdf(file: UploadFile = File(...), machine_name: str = Form(...)
     return {"status": "success", "machine": machine_name, "filename": filename,
             "chunks_stored": len(texts), "old_chunks_replaced": replaced}
 
-# ── Upload Excel / CSV ──
 @app.post("/admin/upload/excel")
 async def upload_excel(file: UploadFile = File(...), machine_name: str = Form(...)):
-    if embedder is None:
-        raise HTTPException(503, "Model still loading, please retry in 30 seconds.")
+    _require_ready()
     machine_name = machine_name.strip()
-    if not machine_name:
-        raise HTTPException(400, "machine_name required")
+    if not machine_name: raise HTTPException(400, "machine_name required")
     filename = f"{machine_name.replace(' ','_')}_{file.filename}"
     filepath = EXCEL_DIR / filename
     data = await file.read()
@@ -241,7 +240,7 @@ async def upload_excel(file: UploadFile = File(...), machine_name: str = Form(..
     filepath.write_bytes(data)
     try:
         df = pd.read_csv(filepath) if file.filename.lower().endswith(".csv") else pd.read_excel(filepath)
-        df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+        df.columns = [str(c).strip().lower().replace(" ","_") for c in df.columns]
     except Exception as e:
         filepath.unlink(missing_ok=True)
         raise HTTPException(500, f"File parsing failed: {e}")
@@ -250,8 +249,7 @@ async def upload_excel(file: UploadFile = File(...), machine_name: str = Form(..
         parts = [f"{k.replace('_',' ').title()}: {str(v).strip()}"
                  for k, v in row.to_dict().items() if pd.notna(v) and str(v).strip()]
         row_text = "\n".join(parts)
-        if not row_text.strip():
-            continue
+        if not row_text.strip(): continue
         texts.append(row_text)
         metas.append({"machine_name": machine_name, "source_excel": filename,
                       "log_id": f"row_{i}", "source": "repair_log", "text": row_text})
@@ -262,7 +260,6 @@ async def upload_excel(file: UploadFile = File(...), machine_name: str = Form(..
     return {"status": "success", "machine": machine_name, "filename": filename,
             "rows_stored": len(texts), "old_rows_replaced": replaced}
 
-# ── Delete single PDF ──
 @app.delete("/admin/delete/pdf/{filename}")
 def delete_pdf(filename: str):
     removed = _remove_by_source(source_pdf=filename)
@@ -272,7 +269,6 @@ def delete_pdf(filename: str):
     if removed == 0 and not existed: raise HTTPException(404, f"'{filename}' not found")
     return {"status": "deleted", "filename": filename, "chunks_removed": removed}
 
-# ── Delete single Excel ──
 @app.delete("/admin/delete/excel/{filename}")
 def delete_excel(filename: str):
     removed = _remove_by_source(source_excel=filename)
@@ -282,7 +278,6 @@ def delete_excel(filename: str):
     if removed == 0 and not existed: raise HTTPException(404, f"'{filename}' not found")
     return {"status": "deleted", "filename": filename, "chunks_removed": removed}
 
-# ── Reset ──
 @app.delete("/admin/reset")
 def reset_all():
     global index, metadata_store, _id_counter
@@ -292,20 +287,16 @@ def reset_all():
         shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True, exist_ok=True)
     return {"status": "reset complete"}
 
-# ── Query ──
 class QueryRequest(BaseModel):
     query: str
     machine_name: str
 
 @app.post("/query")
 async def query_system(req: QueryRequest):
-    if embedder is None:
-        raise HTTPException(503, "Model still loading, please retry in 30 seconds.")
-    if not req.query.strip():
-        raise HTTPException(400, "Query cannot be empty")
+    _require_ready()
+    if not req.query.strip(): raise HTTPException(400, "Query cannot be empty")
     machines = _get_machines() if req.machine_name.lower() == "all" else [req.machine_name]
-    if not machines:
-        raise HTTPException(404, "No machines in knowledge base")
+    if not machines: raise HTTPException(404, "No machines in knowledge base")
     results = []
     for machine in machines:
         chunks = _retrieve(req.query, machine)
@@ -332,7 +323,6 @@ async def query_system(req: QueryRequest):
         })
     return {"results": results}
 
-# ── Format ──
 class FormatRequest(BaseModel):
     context: str
     query: str
@@ -342,14 +332,13 @@ class FormatRequest(BaseModel):
 async def format_response(req: FormatRequest):
     return {"formatted": generate_formatted_response(req.context, req.query, req.machine)}
 
-# ── Info ──
 @app.get("/admin/machines")
 def list_machines():
     return {"machines": _get_machines()}
 
 @app.get("/admin/stats")
 def get_stats():
-    return {"total_chunks": index.ntotal if index else 0,
+    return {"total_chunks": index.ntotal if _ready else 0,
             "machines": _get_machines(), "files": _get_files()}
 
 @app.get("/pdf/{filename}")
