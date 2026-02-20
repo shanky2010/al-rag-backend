@@ -138,13 +138,12 @@
 </div><!-- /app -->
 
 <script>
-// !! REPLACE THIS with your Render backend URL after deploying !!
-// e.g. 'https://al-rag-backend.onrender.com'
-const API = 'https://al-rag-backend.onrender.com';
-
-// ── Chat state ──
+// State declarations (must be at top before any function calls)
 let chats     = JSON.parse(localStorage.getItem('chats') || '[]');
 let currentId = null;
+let _toastTimer;
+
+const API = 'https://al-rag-backend.onrender.com';
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 const role     = localStorage.getItem('currentRole') || 'user';
@@ -311,7 +310,6 @@ function markCompleted() {
 }
 
 // ── Chat history ──────────────────────────────────────────────────────────────
-
 function newChat() {
   currentId = null;
   document.getElementById('textInput').value = '';
@@ -468,7 +466,6 @@ async function deleteFile(type, filename) {
 }
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
-let _toastTimer;
 function showToast(msg, type='info') {
   const el = document.getElementById('toast');
   el.textContent = msg;
