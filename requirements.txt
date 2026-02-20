@@ -6,7 +6,7 @@ uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 
 # Vector store
-faiss-cpu==1.8.0
+faiss-cpu>=1.12.0
 
 # Numpy — pinned for faiss compatibility
 numpy>=1.24,<2.0
