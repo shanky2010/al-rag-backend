@@ -1,31 +1,14 @@
-# IndustrialRAG — Render.com compatible requirements (Python 3.11)
-
-# Web framework
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
-
-# Vector store
 faiss-cpu>=1.12.0
-
-# Numpy — pinned for faiss compatibility
 numpy>=1.24,<2.0
-
-# Embeddings
 sentence-transformers==2.7.0
-
-# Document parsing
 pdfplumber==0.11.0
 pandas==2.2.2
 openpyxl==3.1.2
 xlrd==2.0.1
-
-# LLM
 anthropic>=0.26.0
-
-# OCR (optional)
 pytesseract==0.3.13
 Pillow==10.3.0
-
-# HTTP client
 requests==2.32.0
