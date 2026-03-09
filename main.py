@@ -55,13 +55,14 @@ RELEVANCE_THRESHOLD = 0.55         # Higher threshold — cosine similarity is n
 # ── Gemini Embedder ───────────────────────────────────────────────────────────
 class GeminiEmbedder:
     """
-    Semantic embedder using Google Gemini text-embedding-004 API.
+    Semantic embedder using Google Gemini gemini-embedding-001 API.
     Free tier: 1500 requests/minute — plenty for a prototype.
-    Dim: 768. True semantic understanding (synonyms, context, etc.)
+    Dim: 768 (truncated from 3072 via output_dimensionality param).
+    True semantic understanding (synonyms, context, etc.)
     """
     def __init__(self):
         self.api_key = os.environ.get("GEMINI_API_KEY", "")
-        self.url     = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
+        self.url     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
         self.dim     = EMBEDDING_DIM
         if not self.api_key:
             print("WARNING: GEMINI_API_KEY not set. Falling back to hash embedder.", flush=True)
@@ -71,8 +72,9 @@ class GeminiEmbedder:
         if not self.api_key:
             return self._hash_fallback(text)
         payload = {
-            "model": "models/text-embedding-004",
-            "content": {"parts": [{"text": text[:8000]}]}  # API limit ~8k tokens
+            "model": "models/gemini-embedding-001",
+            "content": {"parts": [{"text": text[:8000]}]},
+            "outputDimensionality": 768   # Truncate from 3072 → 768 to save RAM/storage
         }
         for attempt in range(3):
             try:
