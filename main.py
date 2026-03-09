@@ -1,6 +1,6 @@
 """
 IndustrialRAG - FastAPI Backend
-Clean rewrite — stable, production ready
+Accuracy-focused rewrite for safety-critical maintenance use.
 """
 
 import os
@@ -41,54 +41,90 @@ for d in [PDF_DIR, EXCEL_DIR, VS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-EMBEDDING_DIM       = 384    # all-MiniLM-L6-v2 output dimension
-CHUNK_CHARS         = 800
-OVERLAP_CHARS       = 150
-RELEVANCE_THRESHOLD = 0.35   # cosine similarity floor
+EMBEDDING_DIM       = 768    # bge-base-en-v1.5 output dimension
+CHUNK_CHARS         = 600    # Smaller = more precise retrieval for technical manuals
+OVERLAP_CHARS       = 120    # Overlap preserves context across chunk boundaries
+RELEVANCE_THRESHOLD = 0.40   # BGE cosine similarity floor
+TOP_MANUAL          = 6      # More chunks = better coverage of procedures
+TOP_LOG             = 3
 
 # ── OCR fallback ──────────────────────────────────────────────────────────────
 def _ocr_page(page) -> str:
     try:
         import pytesseract
-        img = page.to_image(resolution=150).original  # lower res = faster, less memory
+        img = page.to_image(resolution=150).original
         return pytesseract.image_to_string(img)
     except Exception as e:
-        print(f"OCR failed (tesseract may not be installed): {e}", flush=True)
+        print(f"OCR failed: {e}", flush=True)
         return ""
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
-def _chunk(text: str) -> list:
-    # Strip image/drawing reference codes like LE34033R0100500140001
+def _chunk(text: str, page_num: int = 0) -> list:
+    """
+    Chunk text and return list of dicts with text + section_hint.
+    Smaller chunks (600 chars) = one procedure step per chunk = precise retrieval.
+    Section header is prepended to every chunk so LLM knows the context.
+    """
+    # Strip image/drawing reference codes and page header noise
     text = re.sub(r'[A-Z]{2}\d{11,}', '', text)
-    # Strip page header noise: "5247-E P-XX"
     text = re.sub(r'5247-E\s+P-[\w().-]+', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    out, start = [], 0
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]+', ' ', text).strip()
+
+    # Detect section headers to tag each chunk with its section
+    header_pattern = re.compile(
+        r'^((?:CHAPTER|SECTION|PART|WARNING|CAUTION|NOTE|PROCEDURE|'
+        r'MAINTENANCE|TROUBLESHOOT|ALARM|ERROR|FAULT|SAFETY|'
+        r'\d+[\.\d]*)\s*[:\-\x96]?\s*.{0,60})$',
+        re.MULTILINE | re.IGNORECASE
+    )
+    section_header = ""
+    first_header = header_pattern.search(text)
+    if first_header:
+        section_header = first_header.group(1).strip()
+
+    out = []
+    start = 0
     while start < len(text):
         end = min(start + CHUNK_CHARS, len(text))
         if end < len(text):
-            for sep in ['. ', '.\n', '\n\n', '\n']:
-                pos = text.rfind(sep, start + int(CHUNK_CHARS * 0.5), end)
+            for sep in ['\n\n', '.\n', '. ', ';\n', '; ']:
+                pos = text.rfind(sep, start + int(CHUNK_CHARS * 0.4), end)
                 if pos != -1:
                     end = pos + len(sep)
                     break
-        chunk = text[start:end].strip()
-        # Raise min chunk size to 80 — avoids noise-only chunks
-        if len(chunk) > 80:
-            out.append(chunk)
+
+        raw_chunk = text[start:end].strip()
+
+        # Update section header if this chunk starts a new section
+        new_header = header_pattern.search(raw_chunk)
+        if new_header:
+            section_header = new_header.group(1).strip()
+
+        # Prepend section header so LLM knows exactly which part of manual this is
+        if section_header and not raw_chunk.startswith(section_header):
+            chunk_text = f"[Section: {section_header}]\n{raw_chunk}"
+        else:
+            chunk_text = raw_chunk
+
+        if len(raw_chunk) > 60:
+            out.append({"text": chunk_text, "section": section_header})
+
         if end >= len(text):
             break
         start = end - OVERLAP_CHARS
+
     return out
 
-# ── Local Embedder (sentence-transformers, no API, no rate limits) ────────────
+# ── Local Embedder: BAAI/bge-base-en-v1.5 ────────────────────────────────────
+# Why BGE over MiniLM:
+#   - Purpose-built for retrieval (RAG), not general sentence similarity
+#   - 768 dimensions — captures more semantic nuance in technical language
+#   - Top ranked on MTEB retrieval benchmark for its size class
+#   - Supports query instruction prefix that improves retrieval by ~10-15%
+#   - No API, no rate limits, no 429s — runs entirely on Render CPU
+
 class LocalEmbedder:
-    """Uses all-MiniLM-L6-v2 running locally on CPU.
-    - No API key needed
-    - No rate limits, no 429s ever
-    - ~50ms per chunk on Render CPU — 179 chunks = ~9 seconds total
-    - 384-dimensional vectors, cosine similarity
-    """
     def __init__(self):
         self.dim   = EMBEDDING_DIM
         self.model = None
@@ -97,22 +133,34 @@ class LocalEmbedder:
     def _load(self):
         try:
             from sentence_transformers import SentenceTransformer
-            print("Loading sentence-transformers model (all-MiniLM-L6-v2)...", flush=True)
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
-            print("Embedder ready — local CPU model loaded.", flush=True)
+            print("Loading BAAI/bge-base-en-v1.5 embedding model...", flush=True)
+            self.model = SentenceTransformer("BAAI/bge-base-en-v1.5")
+            print("Embedder ready — BGE model loaded on CPU.", flush=True)
         except Exception as e:
-            print(f"WARNING: sentence-transformers load failed: {e}", flush=True)
+            print(f"WARNING: Model load failed: {e}. Using hash fallback.", flush=True)
             self.model = None
 
-    def encode(self, texts: list, **kwargs) -> np.ndarray:
+    def encode(self, texts: list, is_query: bool = False) -> np.ndarray:
+        """
+        BGE models use an instruction prefix for queries (not documents).
+        This is critical for retrieval accuracy — do not skip.
+        """
         if self.model is None:
-            print("WARNING: Model not loaded, using hash fallback.", flush=True)
             return np.array([self._hash_fallback(t) for t in texts], dtype=np.float32)
+
+        if is_query:
+            prefixed = [
+                f"Represent this sentence for searching relevant passages: {t}"
+                for t in texts
+            ]
+        else:
+            prefixed = texts  # documents encoded as-is
+
         vecs = self.model.encode(
-            texts,
+            prefixed,
             batch_size=32,
             show_progress_bar=False,
-            normalize_embeddings=True,   # cosine similarity via dot product
+            normalize_embeddings=True,  # enables cosine similarity via dot product
         )
         return np.array(vecs, dtype=np.float32)
 
@@ -130,7 +178,6 @@ class LocalEmbedder:
 
 print("Initializing local embedder...", flush=True)
 embedder = LocalEmbedder()
-print("Embedder ready.", flush=True)
 
 # ── FAISS Index ───────────────────────────────────────────────────────────────
 def _make_index():
@@ -145,7 +192,7 @@ def _load_index():
             if isinstance(meta, list):
                 meta = {i: m for i, m in enumerate(meta)}
             if loaded.d != EMBEDDING_DIM:
-                print(f"WARNING: Index dim mismatch. Resetting.", flush=True)
+                print(f"WARNING: Index dim mismatch ({loaded.d} vs {EMBEDDING_DIM}). Resetting.", flush=True)
                 return _make_index(), {}
             print(f"Loaded index with {loaded.ntotal} chunks.", flush=True)
             return loaded, meta
@@ -171,7 +218,7 @@ def _save():
 def _embed_and_store(texts: list, metas: list):
     if not texts:
         return
-    vecs = embedder.encode(texts)
+    vecs = embedder.encode(texts, is_query=False)
     ids  = [_next_id() for _ in texts]
     with _index_lock:
         index.add_with_ids(np.array(vecs, dtype="float32"), np.array(ids, dtype="int64"))
@@ -193,33 +240,58 @@ def _remove_by_source(source_pdf=None, source_excel=None) -> int:
             _save()
     return len(to_remove)
 
-def _retrieve(query: str, machine: str, top_manual=5, top_log=3) -> list:
+def _retrieve(query: str, machine: str) -> list:
+    """
+    Retrieve most relevant chunks for the query.
+
+    Improvements over original:
+    1. Query gets BGE instruction prefix (is_query=True) — improves retrieval ~10-15%
+    2. Searches 20x candidate pool before threshold filtering
+    3. Max 2 chunks per page — avoids flooding context with same page
+    4. Results sorted by score — best evidence reaches LLM first
+    5. Early break once below threshold (scores are sorted desc by FAISS)
+    """
     if index.ntotal == 0:
         return []
-    q_vec = embedder.encode([query])
-    k = min(index.ntotal, (top_manual + top_log) * 15)
+
+    q_vec = embedder.encode([query], is_query=True)
+    k = min(index.ntotal, (TOP_MANUAL + TOP_LOG) * 20)
     scores, ids = index.search(np.array(q_vec, dtype="float32"), k)
-    print(f"RETRIEVE query='{query[:50]}' machine='{machine}' "
-          f"top5={[round(float(s),3) for s in scores[0][:5]]} threshold={RELEVANCE_THRESHOLD}",
-          flush=True)
+
+    print(
+        f"RETRIEVE query='{query[:60]}' machine='{machine}' "
+        f"top5={[round(float(s),3) for s in scores[0][:5]]} threshold={RELEVANCE_THRESHOLD}",
+        flush=True
+    )
+
     manual, logs = [], []
+    page_chunk_count = {}
+
     for score, idx in zip(scores[0], ids[0]):
         if idx < 0 or idx not in metadata_store:
             continue
         if float(score) < RELEVANCE_THRESHOLD:
-            continue
+            break  # FAISS returns sorted scores — everything below is worse
         meta = metadata_store[idx]
         if machine.lower() != "all" and meta.get("machine_name", "").lower() != machine.lower():
             continue
+
         row = {**meta, "score": round(float(score), 3)}
+
         if meta.get("source") == "repair_log":
-            if len(logs) < top_log:
+            if len(logs) < TOP_LOG:
                 logs.append(row)
         else:
-            if len(manual) < top_manual:
+            page_key = f"{meta.get('source_pdf','')}:{meta.get('page_number',0)}"
+            if page_chunk_count.get(page_key, 0) < 2 and len(manual) < TOP_MANUAL:
                 manual.append(row)
-        if len(manual) >= top_manual and len(logs) >= top_log:
+                page_chunk_count[page_key] = page_chunk_count.get(page_key, 0) + 1
+
+        if len(manual) >= TOP_MANUAL and len(logs) >= TOP_LOG:
             break
+
+    manual.sort(key=lambda x: x["score"], reverse=True)
+    logs.sort(key=lambda x: x["score"], reverse=True)
     return manual + logs
 
 def _get_machines() -> list:
@@ -244,49 +316,70 @@ def _run_pdf_job(job_id: str, filepath: Path, filename: str, machine_name: str, 
     _jobs[job_id] = {"status": "processing", "chunks": 0, "replaced": replaced, "error": None}
     try:
         texts, metas = [], []
-        print(f"PDF job {job_id}: opening file {filepath}", flush=True)
+        print(f"PDF job {job_id}: opening {filepath}", flush=True)
         with pdfplumber.open(filepath) as pdf:
             total_pages = len(pdf.pages)
-            print(f"PDF job {job_id}: {total_pages} pages, starting text extraction...", flush=True)
+            print(f"PDF job {job_id}: {total_pages} pages — extracting...", flush=True)
             for page_num, page in enumerate(pdf.pages, start=1):
                 try:
                     page_text = (page.extract_text() or "").strip()
+
+                    # Extract tables — critical for fault codes, spec tables, alarm lists
+                    tables = page.extract_tables()
+                    if tables:
+                        for table in tables:
+                            for row in table:
+                                row_text = " | ".join(
+                                    str(cell).strip() for cell in row
+                                    if cell and str(cell).strip()
+                                )
+                                if row_text:
+                                    page_text += "\n" + row_text
+
                     if not page_text:
                         page_text = _ocr_page(page).strip()
                     if not page_text:
                         continue
-                    page_chunks = list(_chunk(page_text))
-                    for chunk in page_chunks:
-                        texts.append(chunk)
+
+                    page_chunks = _chunk(page_text, page_num)
+                    for chunk_dict in page_chunks:
+                        texts.append(chunk_dict["text"])
                         metas.append({
                             "machine_name": machine_name,
                             "source_pdf":   filename,
                             "page_number":  page_num,
                             "source":       "manual",
-                            "text":         chunk,
+                            "section":      chunk_dict.get("section", ""),
+                            "text":         chunk_dict["text"],
                         })
+
                     if page_num % 10 == 0 or page_num == total_pages:
-                        print(f"PDF job {job_id}: page {page_num}/{total_pages}, total chunks so far: {len(texts)}", flush=True)
+                        print(f"PDF job {job_id}: page {page_num}/{total_pages}, "
+                              f"chunks: {len(texts)}", flush=True)
                         _jobs[job_id]["chunks"] = len(texts)
                 except Exception as page_err:
-                    print(f"PDF job {job_id}: ERROR on page {page_num}: {page_err}", flush=True)
+                    print(f"PDF job {job_id}: ERROR page {page_num}: {page_err}", flush=True)
                     continue
-        print(f"PDF job {job_id}: extraction done. {len(texts)} chunks. Now embedding in batches...", flush=True)
+
+        print(f"PDF job {job_id}: extraction done. {len(texts)} chunks. Embedding...", flush=True)
         if not texts:
             filepath.unlink(missing_ok=True)
             _jobs[job_id] = {"status": "error", "chunks": 0, "replaced": replaced,
                              "error": "No readable text found in PDF."}
             return
-        # Embed and store in batches of 50 to avoid memory issues and show progress
-        BATCH = 50
+
+        BATCH = 64
         for i in range(0, len(texts), BATCH):
             batch_texts = texts[i:i+BATCH]
             batch_metas = metas[i:i+BATCH]
-            print(f"PDF job {job_id}: embedding batch {i//BATCH + 1}/{(len(texts)-1)//BATCH + 1} ({len(batch_texts)} chunks)...", flush=True)
+            print(f"PDF job {job_id}: embedding batch {i//BATCH + 1}/"
+                  f"{(len(texts)-1)//BATCH + 1} ({len(batch_texts)} chunks)...", flush=True)
             _embed_and_store(batch_texts, batch_metas)
             _jobs[job_id]["chunks"] = i + len(batch_texts)
+
         _jobs[job_id] = {"status": "done", "chunks": len(texts), "replaced": replaced, "error": None}
         print(f"PDF job {job_id}: DONE — {len(texts)} chunks stored.", flush=True)
+
     except Exception as e:
         import traceback
         err_detail = traceback.format_exc()
@@ -324,9 +417,12 @@ app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "chunks_indexed": index.ntotal,
-            "embedder": "local-cpu" if embedder.model else "hash_fallback",
-            "machines": _get_machines()}
+    return {
+        "status": "ok",
+        "chunks_indexed": index.ntotal,
+        "embedder": "BAAI/bge-base-en-v1.5" if embedder.model else "hash_fallback",
+        "machines": _get_machines()
+    }
 
 @app.get("/admin/machines")
 def list_machines():
@@ -365,7 +461,7 @@ async def upload_pdf(
     background_tasks.add_task(_run_pdf_job, job_id, filepath, filename, machine_name, replaced)
     print(f"PDF upload queued: {filename} → {job_id}", flush=True)
     return {"status": "processing", "job_id": job_id, "machine": machine_name,
-            "filename": filename, "message": "Polling /admin/job/{job_id} for status."}
+            "filename": filename, "message": "Poll /admin/job/{job_id} for status."}
 
 @app.post("/admin/upload/excel")
 async def upload_excel(file: UploadFile = File(...), machine_name: str = Form(...)):
@@ -424,10 +520,8 @@ def delete_excel(filename: str):
         raise HTTPException(404, f"'{filename}' not found")
     return {"status": "deleted", "filename": filename, "chunks_removed": removed}
 
-
 @app.post("/admin/test-pdf-parse")
 async def test_pdf_parse(file: UploadFile = File(...)):
-    """Debug endpoint: returns first 3 pages text extraction WITHOUT embedding."""
     import io
     data = await file.read()
     if not data:
@@ -436,16 +530,18 @@ async def test_pdf_parse(file: UploadFile = File(...)):
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             total = len(pdf.pages)
-            for i, page in enumerate(pdf.pages[:5]):  # first 5 pages only
+            for i, page in enumerate(pdf.pages[:5]):
                 raw = (page.extract_text() or "").strip()
                 ocr_text = ""
                 if not raw:
                     ocr_text = _ocr_page(page).strip()
+                chunks = _chunk(raw or ocr_text, i+1)
                 results.append({
                     "page": i+1,
-                    "pdfplumber_chars": len(raw),
-                    "ocr_chars": len(ocr_text),
-                    "sample": (raw or ocr_text)[:200],
+                    "chars": len(raw or ocr_text),
+                    "chunks_produced": len(chunks),
+                    "sample": (raw or ocr_text)[:300],
+                    "first_chunk": chunks[0]["text"][:300] if chunks else "",
                 })
     except Exception as e:
         raise HTTPException(500, f"PDF parse error: {e}")
@@ -477,32 +573,59 @@ async def query_system(req: QueryRequest):
     machines = _get_machines() if req.machine_name.lower() == "all" else [req.machine_name]
     if not machines:
         raise HTTPException(404, "No machines in knowledge base")
+
     results = []
     for machine in machines:
         chunks = _retrieve(req.query, machine)
         if not chunks:
             continue
+
         manual_chunks = [c for c in chunks if c.get("source") == "manual"]
         log_chunks    = [c for c in chunks if c.get("source") == "repair_log"]
-        context_parts, references, seen_refs = [], [], set()
+
+        context_parts = []
+        references    = []
+        seen_refs     = set()
+
         for c in manual_chunks:
-            context_parts.append(f"[MANUAL - Page {c.get('page_number','?')} | {c.get('source_pdf','')}]\n{c['text']}")
-            key = f"{c.get('source_pdf','')}:{c.get('page_number',1)}"
+            page    = c.get("page_number", "?")
+            pdf     = c.get("source_pdf", "")
+            score   = c.get("score", 0)
+            section = c.get("section", "")
+            header  = f"[MANUAL | Page {page} | Relevance {score:.2f}"
+            if section:
+                header += f" | {section}"
+            header += f" | {pdf}]"
+            context_parts.append(f"{header}\n{c['text']}")
+            key = f"{pdf}:{page}"
             if key not in seen_refs:
                 seen_refs.add(key)
-                references.append({"pdf": c.get("source_pdf",""), "page": c.get("page_number",1)})
+                references.append({"pdf": pdf, "page": page})
+
         for c in log_chunks:
-            context_parts.append(f"[REPAIR LOG]\n{c['text']}")
+            score = c.get("score", 0)
+            context_parts.append(f"[REPAIR LOG | Relevance {score:.2f}]\n{c['text']}")
+
         results.append({
-            "machine": machine, "query": req.query,
-            "context": "\n\n---\n\n".join(context_parts),
-            "references": references,
+            "machine":            machine,
+            "query":              req.query,
+            "context":            "\n\n---\n\n".join(context_parts),
+            "references":         references,
             "manual_chunks_used": len(manual_chunks),
             "log_chunks_used":    len(log_chunks),
-            "_chunks": [{"text": c.get("text","")[:400], "score": c.get("score",0),
-                         "source": c.get("source","manual"), "page_number": c.get("page_number"),
-                         "source_pdf": c.get("source_pdf","")} for c in chunks],
+            "_chunks": [
+                {
+                    "text":        c.get("text", "")[:400],
+                    "score":       c.get("score", 0),
+                    "source":      c.get("source", "manual"),
+                    "page_number": c.get("page_number"),
+                    "source_pdf":  c.get("source_pdf", ""),
+                    "section":     c.get("section", ""),
+                }
+                for c in chunks
+            ],
         })
+
     return {"results": results}
 
 class FormatRequest(BaseModel):
