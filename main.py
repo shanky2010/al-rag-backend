@@ -1,17 +1,18 @@
 """
 IndustrialRAG - FastAPI Backend
-Lightweight version for Render free tier (512MB RAM)
-Uses hash-based embeddings instead of heavy sentence-transformers/torch
+Uses Google Gemini API for semantic embeddings (free tier)
 """
 
 import os
 import shutil
 import hashlib
+import time
 from pathlib import Path
 
 import numpy as np
 import faiss
 import pickle
+import requests
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,7 +35,7 @@ sys.path.append(str(Path(__file__).parent))
 from llm_formatter import generate_formatted_response
 import pandas as pd
 
-# Paths
+# ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
 PDF_DIR    = BASE_DIR / "uploads" / "pdfs"
 EXCEL_DIR  = BASE_DIR / "uploads" / "excels"
@@ -45,45 +46,90 @@ META_PATH  = VS_DIR / "metadata.pkl"
 for d in [PDF_DIR, EXCEL_DIR, VS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-EMBEDDING_DIM       = 512
+# ── Constants ─────────────────────────────────────────────────────────────────
+EMBEDDING_DIM       = 768          # Gemini text-embedding-004 outputs 768-dim
 CHUNK_CHARS         = 2400
 OVERLAP_CHARS       = 400
-RELEVANCE_THRESHOLD = 0.15
+RELEVANCE_THRESHOLD = 0.55         # Higher threshold — cosine similarity is now meaningful
 
-class LightEmbedder:
-    """Hash-based bag-of-words embedder. No torch, ~5MB RAM."""
-    def __init__(self, dim=512):
-        self.dim = dim
+# ── Gemini Embedder ───────────────────────────────────────────────────────────
+class GeminiEmbedder:
+    """
+    Semantic embedder using Google Gemini text-embedding-004 API.
+    Free tier: 1500 requests/minute — plenty for a prototype.
+    Dim: 768. True semantic understanding (synonyms, context, etc.)
+    """
+    def __init__(self):
+        self.api_key = os.environ.get("GEMINI_API_KEY", "")
+        self.url     = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
+        self.dim     = EMBEDDING_DIM
+        if not self.api_key:
+            print("WARNING: GEMINI_API_KEY not set. Falling back to hash embedder.", flush=True)
 
-    def _tokenize(self, text):
+    def _embed_one(self, text: str) -> np.ndarray:
+        """Call Gemini API for a single text. Returns normalized 768-dim vector."""
+        if not self.api_key:
+            return self._hash_fallback(text)
+        payload = {
+            "model": "models/text-embedding-004",
+            "content": {"parts": [{"text": text[:8000]}]}  # API limit ~8k tokens
+        }
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    self.url,
+                    params={"key": self.api_key},
+                    json=payload,
+                    timeout=15
+                )
+                if resp.status_code == 429:
+                    time.sleep(2 ** attempt)
+                    continue
+                resp.raise_for_status()
+                vec = np.array(resp.json()["embedding"]["values"], dtype=np.float32)
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+                return vec
+            except Exception as e:
+                print(f"Gemini embed error (attempt {attempt+1}): {e}", flush=True)
+                time.sleep(1)
+        # All attempts failed — fall back to hash
+        return self._hash_fallback(text)
+
+    def _hash_fallback(self, text: str) -> np.ndarray:
+        """MD5 hash fallback if API is unavailable."""
         import re
         text = text.lower()
         tokens = re.findall(r'[a-z0-9]+', text)
         bigrams = [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens)-1)]
-        return tokens + bigrams
+        vec = np.zeros(self.dim, dtype=np.float32)
+        for token in tokens + bigrams:
+            h = int(hashlib.md5(token.encode()).hexdigest(), 16)
+            vec[h % self.dim] += 1.0
+        vec = np.sign(vec) * np.log1p(np.abs(vec))
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec
 
-    def encode(self, texts, normalize_embeddings=True, show_progress_bar=False):
+    def encode(self, texts: list, normalize_embeddings=True, show_progress_bar=False) -> np.ndarray:
+        """Encode a list of texts. Rate-limited to avoid hitting API limits."""
         vecs = []
-        for text in texts:
-            vec = np.zeros(self.dim, dtype=np.float32)
-            tokens = self._tokenize(text)
-            if tokens:
-                for token in tokens:
-                    h = int(hashlib.md5(token.encode()).hexdigest(), 16)
-                    idx = h % self.dim
-                    vec[idx] += 1.0
-                vec = np.sign(vec) * np.log1p(np.abs(vec))
-            if normalize_embeddings:
-                norm = np.linalg.norm(vec)
-                if norm > 0:
-                    vec = vec / norm
+        for i, text in enumerate(texts):
+            vec = self._embed_one(text)
             vecs.append(vec)
+            # Small delay every 10 requests to stay within free tier limits
+            if i > 0 and i % 10 == 0:
+                time.sleep(0.5)
         return np.array(vecs, dtype=np.float32)
 
-print("Initializing embedder...", flush=True)
-embedder = LightEmbedder(dim=EMBEDDING_DIM)
+
+print("Initializing Gemini embedder...", flush=True)
+embedder = GeminiEmbedder()
 print("Embedder ready.", flush=True)
 
+# ── FAISS Index ───────────────────────────────────────────────────────────────
 def _make_index():
     return faiss.IndexIDMap(faiss.IndexFlatIP(EMBEDDING_DIM))
 
@@ -97,6 +143,10 @@ def _load_index():
                 meta = pickle.load(f)
             if isinstance(meta, list):
                 meta = {i: m for i, m in enumerate(meta)}
+            # Dimension check — if old index was 512-dim, start fresh
+            if loaded.d != EMBEDDING_DIM:
+                print(f"WARNING: Index dimension mismatch ({loaded.d} vs {EMBEDDING_DIM}). Starting fresh.", flush=True)
+                return _make_index(), {}
             print(f"Loaded index with {loaded.ntotal} chunks.", flush=True)
             return loaded, meta
         except Exception as e:
@@ -189,6 +239,7 @@ def _get_files():
         files[key]["chunks"] += 1
     return list(files.values())
 
+# ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(title="IndustrialRAG")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
@@ -344,4 +395,5 @@ def serve_pdf(filename: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "chunks_indexed": index.ntotal, "model": "ready"}
+    gemini_status = "connected" if embedder.api_key else "missing_key_using_fallback"
+    return {"status": "ok", "chunks_indexed": index.ntotal, "embedder": gemini_status}
