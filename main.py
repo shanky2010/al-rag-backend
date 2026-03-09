@@ -41,10 +41,10 @@ for d in [PDF_DIR, EXCEL_DIR, VS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-EMBEDDING_DIM       = 768
-CHUNK_CHARS         = 800    # Smaller chunks = better retrieval precision
+EMBEDDING_DIM       = 384    # all-MiniLM-L6-v2 output dimension
+CHUNK_CHARS         = 800
 OVERLAP_CHARS       = 150
-RELEVANCE_THRESHOLD = 0.35   # Gemini cosine similarity floor
+RELEVANCE_THRESHOLD = 0.35   # cosine similarity floor
 
 # ── OCR fallback ──────────────────────────────────────────────────────────────
 def _ocr_page(page) -> str:
@@ -81,55 +81,40 @@ def _chunk(text: str) -> list:
         start = end - OVERLAP_CHARS
     return out
 
-# ── Gemini Embedder ───────────────────────────────────────────────────────────
-class GeminiEmbedder:
+# ── Local Embedder (sentence-transformers, no API, no rate limits) ────────────
+class LocalEmbedder:
+    """Uses all-MiniLM-L6-v2 running locally on CPU.
+    - No API key needed
+    - No rate limits, no 429s ever
+    - ~50ms per chunk on Render CPU — 179 chunks = ~9 seconds total
+    - 384-dimensional vectors, cosine similarity
+    """
     def __init__(self):
-        self.api_key = os.environ.get("GEMINI_API_KEY", "")
-        self.url     = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
-        self.dim     = EMBEDDING_DIM
-        if not self.api_key:
-            print("WARNING: GEMINI_API_KEY not set. Using hash fallback.", flush=True)
+        self.dim   = EMBEDDING_DIM
+        self.model = None
+        self._load()
 
-    def _embed_one(self, text: str, base_delay: float = 1.2) -> np.ndarray:
-        """Embed one text with capped-backoff 429 handling.
+    def _load(self):
+        try:
+            from sentence_transformers import SentenceTransformer
+            print("Loading sentence-transformers model (all-MiniLM-L6-v2)...", flush=True)
+            self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            print("Embedder ready — local CPU model loaded.", flush=True)
+        except Exception as e:
+            print(f"WARNING: sentence-transformers load failed: {e}", flush=True)
+            self.model = None
 
-        Gemini free tier limit: ~1500 req/min sustained, but rapid bursts
-        trigger 429s immediately. Strategy:
-          - Caller already sleeps base_delay between calls (avoids burst)
-          - On 429: wait 15s flat then retry (NOT exponential — exponential
-            blows past Render's 15-min process timeout with just a few failures)
-          - Max 3 retries per chunk (45s worst case), then hash fallback
-        """
-        if not self.api_key:
-            return self._hash_fallback(text)
-        payload = {
-            "model": "models/gemini-embedding-001",
-            "content": {"parts": [{"text": text[:8000]}]},
-            "outputDimensionality": self.dim,
-        }
-        for attempt in range(3):
-            try:
-                resp = requests.post(
-                    self.url,
-                    params={"key": self.api_key},
-                    json=payload,
-                    timeout=20,
-                )
-                if resp.status_code == 429:
-                    wait = 15  # flat 15s — safe but won't blow the timeout budget
-                    print(f"Gemini embed 429 — waiting {wait}s (attempt {attempt+1}/3)", flush=True)
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                vec = np.array(resp.json()["embedding"]["values"], dtype=np.float32)
-                norm = np.linalg.norm(vec)
-                return vec / norm if norm > 0 else vec
-            except Exception as e:
-                print(f"Gemini embed error (attempt {attempt+1}): {type(e).__name__}: {e}", flush=True)
-                if attempt < 2:
-                    time.sleep(5)
-        print(f"WARNING: Gemini failed after 3 attempts, using hash fallback for: {text[:60]!r}", flush=True)
-        return self._hash_fallback(text)
+    def encode(self, texts: list, **kwargs) -> np.ndarray:
+        if self.model is None:
+            print("WARNING: Model not loaded, using hash fallback.", flush=True)
+            return np.array([self._hash_fallback(t) for t in texts], dtype=np.float32)
+        vecs = self.model.encode(
+            texts,
+            batch_size=32,
+            show_progress_bar=False,
+            normalize_embeddings=True,   # cosine similarity via dot product
+        )
+        return np.array(vecs, dtype=np.float32)
 
     def _hash_fallback(self, text: str) -> np.ndarray:
         tokens = re.findall(r'[a-z0-9]+', text.lower())
@@ -142,26 +127,9 @@ class GeminiEmbedder:
         norm = np.linalg.norm(vec)
         return vec / norm if norm > 0 else vec
 
-    def encode(self, texts: list, **kwargs) -> np.ndarray:
-        """Embed a list of texts at a safe rate for Gemini free tier.
 
-        1.2s between requests = ~50 req/min, well under the burst threshold.
-        For 179 chunks: ~3.6 min total embedding time — fits Render's 15-min limit.
-        Every 50 chunks we pause 5s to let the quota window reset.
-        """
-        vecs = []
-        for i, text in enumerate(texts):
-            vec = self._embed_one(text)
-            vecs.append(vec)
-            time.sleep(1.2)            # 50 req/min — avoids burst 429s
-            if (i + 1) % 50 == 0:     # extra 5s cooldown every 50 chunks
-                print(f"Embedder: {i+1}/{len(texts)} chunks done — brief cooldown...", flush=True)
-                time.sleep(5)
-        return np.array(vecs, dtype=np.float32)
-
-
-print("Initializing Gemini embedder...", flush=True)
-embedder = GeminiEmbedder()
+print("Initializing local embedder...", flush=True)
+embedder = LocalEmbedder()
 print("Embedder ready.", flush=True)
 
 # ── FAISS Index ───────────────────────────────────────────────────────────────
@@ -357,7 +325,7 @@ app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 @app.get("/health")
 def health():
     return {"status": "ok", "chunks_indexed": index.ntotal,
-            "embedder": "connected" if embedder.api_key else "hash_fallback",
+            "embedder": "local-cpu" if embedder.model else "hash_fallback",
             "machines": _get_machines()}
 
 @app.get("/admin/machines")

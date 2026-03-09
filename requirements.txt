@@ -13,3 +13,5 @@ pytesseract==0.3.13
 Pillow==10.3.0
 requests==2.32.0
 groq
+sentence-transformers==3.0.1
+torch==2.3.1+cpu
