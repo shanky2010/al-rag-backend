@@ -64,7 +64,7 @@ def _gemini(context: str, query: str, machine: str) -> Optional[str]:
         print("LLM: GEMINI_API_KEY not set, skipping.", flush=True)
         return None
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         full_prompt = f"{SYSTEM_PROMPT}\n\n{_build_prompt(context, query, machine)}"
         payload = {
             "contents": [{"parts": [{"text": full_prompt}]}],
