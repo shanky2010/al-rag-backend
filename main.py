@@ -106,36 +106,83 @@ def _chunk(text: str) -> list:
 
     return out
 
-# ── Local Embedder: all-MiniLM-L6-v2 ─────────────────────────────────────────
-# 90MB RAM — fits comfortably in Render free tier (512MB limit)
-# No API calls, no rate limits, no 429s, embeds 179 chunks in ~10 seconds on CPU
+# ── Local Embedder: all-MiniLM-L6-v2 via ONNX Runtime ────────────────────────
+# Why ONNX instead of sentence-transformers + PyTorch:
+#   - PyTorch alone uses ~350MB RAM on import — blows Render free tier (512MB)
+#   - onnxruntime-cpu uses ~40MB RAM for the same model
+#   - Same model, same 384-dim vectors, same cosine similarity quality
+#   - No GPU dependencies, no CUDA packages, pure CPU inference
+#   - model downloaded once from HuggingFace on first startup (~90MB)
 
 class LocalEmbedder:
     def __init__(self):
-        self.dim   = EMBEDDING_DIM
-        self.model = None
+        self.dim     = EMBEDDING_DIM
+        self.session = None
+        self.tokenizer = None
         self._load()
 
     def _load(self):
         try:
-            from sentence_transformers import SentenceTransformer
-            print("Loading all-MiniLM-L6-v2 embedding model...", flush=True)
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
-            print("Embedder ready — local CPU model loaded.", flush=True)
+            from tokenizers import Tokenizer
+            import onnxruntime as ort
+            from huggingface_hub import hf_hub_download
+            import json
+
+            print("Downloading MiniLM ONNX model from HuggingFace...", flush=True)
+
+            # Download ONNX model and tokenizer from HuggingFace
+            model_path     = hf_hub_download("sentence-transformers/all-MiniLM-L6-v2",
+                                              filename="onnx/model.onnx")
+            tokenizer_path = hf_hub_download("sentence-transformers/all-MiniLM-L6-v2",
+                                              filename="tokenizer.json")
+
+            self.tokenizer = Tokenizer.from_file(tokenizer_path)
+            self.tokenizer.enable_padding(pad_id=0, pad_token="[PAD]", length=128)
+            self.tokenizer.enable_truncation(max_length=128)
+
+            opts = ort.SessionOptions()
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = 1
+            self.session = ort.InferenceSession(model_path, sess_options=opts,
+                                                providers=["CPUExecutionProvider"])
+            print("Embedder ready — MiniLM ONNX loaded (~40MB RAM).", flush=True)
+
         except Exception as e:
-            print(f"WARNING: Model load failed: {e}. Using hash fallback.", flush=True)
-            self.model = None
+            print(f"WARNING: ONNX load failed: {e}. Using hash fallback.", flush=True)
+            self.session  = None
+            self.tokenizer = None
 
     def encode(self, texts: list, is_query: bool = False, **kwargs) -> np.ndarray:
-        if self.model is None:
+        if self.session is None or self.tokenizer is None:
             return np.array([self._hash_fallback(t) for t in texts], dtype=np.float32)
-        vecs = self.model.encode(
-            texts,
-            batch_size=32,
-            show_progress_bar=False,
-            normalize_embeddings=True,  # cosine similarity via dot product
-        )
-        return np.array(vecs, dtype=np.float32)
+
+        BATCH = 32
+        all_vecs = []
+        for i in range(0, len(texts), BATCH):
+            batch = texts[i:i+BATCH]
+            encoded = self.tokenizer.encode_batch(batch)
+            input_ids      = np.array([e.ids              for e in encoded], dtype=np.int64)
+            attention_mask = np.array([e.attention_mask   for e in encoded], dtype=np.int64)
+            token_type_ids = np.array([[0]*len(e.ids)     for e in encoded], dtype=np.int64)
+
+            outputs = self.session.run(None, {
+                "input_ids":      input_ids,
+                "attention_mask": attention_mask,
+                "token_type_ids": token_type_ids,
+            })
+
+            # Mean pooling over token embeddings, weighted by attention mask
+            token_embeddings = outputs[0]  # (batch, seq_len, hidden)
+            mask = attention_mask[:, :, np.newaxis].astype(np.float32)
+            summed = (token_embeddings * mask).sum(axis=1)
+            counts = mask.sum(axis=1).clip(min=1e-9)
+            mean_pooled = summed / counts
+
+            # L2 normalize
+            norms = np.linalg.norm(mean_pooled, axis=1, keepdims=True).clip(min=1e-9)
+            all_vecs.append((mean_pooled / norms).astype(np.float32))
+
+        return np.vstack(all_vecs)
 
     def _hash_fallback(self, text: str) -> np.ndarray:
         tokens = re.findall(r'[a-z0-9]+', text.lower())
@@ -149,7 +196,7 @@ class LocalEmbedder:
         return vec / norm if norm > 0 else vec
 
 
-print("Initializing local embedder...", flush=True)
+print("Initializing ONNX embedder...", flush=True)
 embedder = LocalEmbedder()
 print("Embedder ready.", flush=True)
 
