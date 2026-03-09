@@ -52,7 +52,7 @@ for d in [PDF_DIR, EXCEL_DIR, VS_DIR]:
 EMBEDDING_DIM       = 768          # Gemini text-embedding-004 outputs 768-dim
 CHUNK_CHARS         = 2400
 OVERLAP_CHARS       = 400
-RELEVANCE_THRESHOLD = 0.55         # Higher threshold — cosine similarity is now meaningful
+RELEVANCE_THRESHOLD = 0.0          # Disabled for debugging — set back to 0.45 once working
 
 # ── Gemini Embedder ───────────────────────────────────────────────────────────
 class GeminiEmbedder:
@@ -211,6 +211,8 @@ def _retrieve(query, machine, top_manual=5, top_log=3):
     q_vec = embedder.encode([query], normalize_embeddings=True)
     k = min(index.ntotal, (top_manual + top_log) * 10)
     scores, ids = index.search(np.array(q_vec, dtype="float32"), k)
+    top_scores = [round(float(s), 3) for s in scores[0][:5]]
+    print(f"DEBUG _retrieve: query='{query}' machine='{machine}' top5_scores={top_scores} threshold={RELEVANCE_THRESHOLD}", flush=True)
     manual, logs = [], []
     for score, idx in zip(scores[0], ids[0]):
         if idx < 0 or idx not in metadata_store:
@@ -456,6 +458,27 @@ def serve_pdf(filename: str):
 def health():
     gemini_status = "connected" if embedder.api_key else "missing_key_using_fallback"
     return {"status": "ok", "chunks_indexed": index.ntotal, "embedder": gemini_status}
+
+@app.post("/debug/scores")
+async def debug_scores(req: QueryRequest):
+    """Returns raw similarity scores for debugging."""
+    if index.ntotal == 0:
+        return {"error": "Index is empty"}
+    q_vec = embedder.encode([req.query], normalize_embeddings=True)
+    k = min(index.ntotal, 20)
+    scores, ids = index.search(np.array(q_vec, dtype="float32"), k)
+    results = []
+    for score, idx in zip(scores[0], ids[0]):
+        if idx < 0 or idx not in metadata_store:
+            continue
+        meta = metadata_store[idx]
+        results.append({
+            "score": round(float(score), 4),
+            "machine": meta.get("machine_name"),
+            "page": meta.get("page_number"),
+            "text_preview": meta.get("text", "")[:100]
+        })
+    return {"query": req.query, "total_indexed": index.ntotal, "results": results}
 
 # ── Keep-alive (prevents Render free tier from sleeping) ─────────────────────
 def _keep_alive():
