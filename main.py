@@ -324,15 +324,17 @@ async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(
     data      = await file.read()
     replaced  = _remove_by_source(source_pdf=filename)
     filepath.write_bytes(data)
-    job_id = f"{filename}_{int(time.time())}"
+    job_id = f"job_{int(time.time())}_{safe_name}"
     background_tasks.add_task(_process_pdf_background, job_id, filepath, filename, machine_name, replaced)
     return {"status": "processing", "job_id": job_id, "machine": machine_name,
             "filename": filename, "message": "PDF is being processed. Poll /admin/job/{job_id} for status."}
 
-@app.get("/admin/job/{job_id}")
+@app.get("/admin/job/{job_id:path}")
 def get_job_status(job_id: str):
     job = _upload_jobs.get(job_id)
     if not job:
+        # Also check all jobs for debugging
+        print(f"Job '{job_id}' not found. Available jobs: {list(_upload_jobs.keys())}", flush=True)
         raise HTTPException(404, "Job not found")
     return job
 
