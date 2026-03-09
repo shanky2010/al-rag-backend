@@ -346,7 +346,7 @@ app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 @app.get("/health")
 def health():
     return {"status": "ok", "chunks_indexed": index.ntotal,
-            "embedder": "connected" if embedder.api_key else "hash_fallback",
+            "embedder": "all-MiniLM-L6-v2" if embedder.model else "hash_fallback",
             "machines": _get_machines()}
 
 @app.get("/admin/machines")
