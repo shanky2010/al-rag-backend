@@ -58,6 +58,10 @@ def _ocr_page(page) -> str:
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
 def _chunk(text: str) -> list:
+    # Strip image/drawing reference codes like LE34033R0100500140001
+    text = re.sub(r'[A-Z]{2}\d{11,}', '', text)
+    # Strip page header noise: "5247-E P-XX"
+    text = re.sub(r'5247-E\s+P-[\w().-]+', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     out, start = [], 0
     while start < len(text):
@@ -69,7 +73,8 @@ def _chunk(text: str) -> list:
                     end = pos + len(sep)
                     break
         chunk = text[start:end].strip()
-        if len(chunk) > 60:
+        # Raise min chunk size to 80 — avoids noise-only chunks
+        if len(chunk) > 80:
             out.append(chunk)
         if end >= len(text):
             break
@@ -93,16 +98,18 @@ class GeminiEmbedder:
             "content": {"parts": [{"text": text[:8000]}]},
             "outputDimensionality": self.dim,
         }
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 resp = requests.post(
                     self.url,
                     params={"key": self.api_key},
                     json=payload,
-                    timeout=15,
+                    timeout=20,
                 )
                 if resp.status_code == 429:
-                    time.sleep(2 ** attempt)
+                    wait = 5 * (2 ** attempt)  # 5s, 10s, 20s, 40s, 80s
+                    print(f"Gemini embed 429 — waiting {wait}s (attempt {attempt+1})", flush=True)
+                    time.sleep(wait)
                     continue
                 resp.raise_for_status()
                 vec = np.array(resp.json()["embedding"]["values"], dtype=np.float32)
@@ -110,8 +117,8 @@ class GeminiEmbedder:
                 return vec / norm if norm > 0 else vec
             except Exception as e:
                 print(f"Gemini embed error (attempt {attempt+1}): {type(e).__name__}: {e}", flush=True)
-                time.sleep(2 ** attempt)
-        print(f"WARNING: All Gemini attempts failed, using hash fallback for text: {text[:60]!r}", flush=True)
+                time.sleep(3 * (attempt + 1))
+        print(f"WARNING: All Gemini attempts failed, using hash fallback for: {text[:60]!r}", flush=True)
         return self._hash_fallback(text)
 
     def _hash_fallback(self, text: str) -> np.ndarray:
@@ -130,9 +137,9 @@ class GeminiEmbedder:
         for i, text in enumerate(texts):
             vec = self._embed_one(text)
             vecs.append(vec)
-            # Rate limiting: pause every 5 requests to avoid 429
-            if (i + 1) % 5 == 0:
-                time.sleep(0.3)
+            # Gemini free tier: ~1500 req/min but bursts trigger 429
+            # Sleep 0.5s every request = max 120/min = safe
+            time.sleep(0.5)
         return np.array(vecs, dtype=np.float32)
 
 
