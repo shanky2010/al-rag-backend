@@ -14,11 +14,12 @@ import faiss
 import pickle
 import requests
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+import threading
 
 import pdfplumber
 
@@ -37,9 +38,10 @@ import pandas as pd
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
-PDF_DIR    = BASE_DIR / "uploads" / "pdfs"
-EXCEL_DIR  = BASE_DIR / "uploads" / "excels"
-VS_DIR     = BASE_DIR / "vectorstore"
+DATA_DIR   = Path(os.environ.get("DATA_DIR", str(BASE_DIR)))
+PDF_DIR    = DATA_DIR / "uploads" / "pdfs"
+EXCEL_DIR  = DATA_DIR / "uploads" / "excels"
+VS_DIR     = DATA_DIR / "vectorstore"
 INDEX_PATH = VS_DIR / "index.faiss"
 META_PATH  = VS_DIR / "metadata.pkl"
 
@@ -243,39 +245,94 @@ def _get_files():
 
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(title="IndustrialRAG")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+# Explicit CORS headers on every response (belt-and-suspenders for Render proxy)
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+
+class ForceCORSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        if request.method == "OPTIONS":
+            from fastapi.responses import Response
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Max-Age": "86400",
+                },
+            )
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+
+app.add_middleware(ForceCORSMiddleware)
 app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 
+# ── Upload job tracker ────────────────────────────────────────────────────────
+_upload_jobs: dict = {}  # job_id -> {status, chunks, error}
+
+def _process_pdf_background(job_id: str, filepath: Path, filename: str, machine_name: str, replaced: int):
+    _upload_jobs[job_id] = {"status": "processing", "chunks": 0, "error": None, "replaced": replaced}
+    texts, metas = [], []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                page_text = (page.extract_text() or "").strip()
+                if not page_text:
+                    page_text = _ocr_page(page).strip()
+                if not page_text:
+                    continue
+                for chunk in _chunk(page_text):
+                    texts.append(chunk)
+                    metas.append({"machine_name": machine_name, "source_pdf": filename,
+                                  "page_number": page_num, "source": "manual", "text": chunk})
+        if not texts:
+            filepath.unlink(missing_ok=True)
+            _upload_jobs[job_id] = {"status": "error", "chunks": 0, "error": "No readable text found in PDF.", "replaced": replaced}
+            return
+        _embed_and_store(texts, metas)
+        _upload_jobs[job_id] = {"status": "done", "chunks": len(texts), "error": None, "replaced": replaced}
+        print(f"PDF job {job_id} done: {len(texts)} chunks stored.", flush=True)
+    except Exception as e:
+        filepath.unlink(missing_ok=True)
+        _upload_jobs[job_id] = {"status": "error", "chunks": 0, "error": str(e), "replaced": replaced}
+        print(f"PDF job {job_id} error: {e}", flush=True)
+
 @app.post("/admin/upload/pdf")
-async def upload_pdf(file: UploadFile = File(...), machine_name: str = Form(...)):
+async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...), machine_name: str = Form(...)):
     machine_name = machine_name.strip()
-    if not machine_name: raise HTTPException(400, "machine_name is required")
+    if not machine_name:
+        raise HTTPException(400, "machine_name is required")
     safe_name = machine_name.replace(" ", "_")
     filename  = f"{safe_name}_{file.filename}"
     filepath  = PDF_DIR / filename
     data      = await file.read()
     replaced  = _remove_by_source(source_pdf=filename)
     filepath.write_bytes(data)
-    texts, metas = [], []
-    try:
-        with pdfplumber.open(filepath) as pdf:
-            for page_num, page in enumerate(pdf.pages, start=1):
-                page_text = (page.extract_text() or "").strip()
-                if not page_text: page_text = _ocr_page(page).strip()
-                if not page_text: continue
-                for chunk in _chunk(page_text):
-                    texts.append(chunk)
-                    metas.append({"machine_name": machine_name, "source_pdf": filename,
-                                  "page_number": page_num, "source": "manual", "text": chunk})
-    except Exception as e:
-        filepath.unlink(missing_ok=True)
-        raise HTTPException(500, f"PDF parsing failed: {e}")
-    if not texts:
-        filepath.unlink(missing_ok=True)
-        raise HTTPException(422, "No readable text found in PDF.")
-    _embed_and_store(texts, metas)
-    return {"status": "success", "machine": machine_name, "filename": filename,
-            "chunks_stored": len(texts), "old_chunks_replaced": replaced}
+    job_id = f"{filename}_{int(time.time())}"
+    background_tasks.add_task(_process_pdf_background, job_id, filepath, filename, machine_name, replaced)
+    return {"status": "processing", "job_id": job_id, "machine": machine_name,
+            "filename": filename, "message": "PDF is being processed. Poll /admin/job/{job_id} for status."}
+
+@app.get("/admin/job/{job_id}")
+def get_job_status(job_id: str):
+    job = _upload_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
 
 @app.post("/admin/upload/excel")
 async def upload_excel(file: UploadFile = File(...), machine_name: str = Form(...)):
@@ -399,3 +456,18 @@ def serve_pdf(filename: str):
 def health():
     gemini_status = "connected" if embedder.api_key else "missing_key_using_fallback"
     return {"status": "ok", "chunks_indexed": index.ntotal, "embedder": gemini_status}
+
+# ── Keep-alive (prevents Render free tier from sleeping) ─────────────────────
+def _keep_alive():
+    url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not url:
+        return
+    while True:
+        time.sleep(840)  # ping every 14 minutes
+        try:
+            requests.get(f"{url}/health", timeout=10)
+            print("Keep-alive ping sent.", flush=True)
+        except Exception:
+            pass
+
+threading.Thread(target=_keep_alive, daemon=True).start()
