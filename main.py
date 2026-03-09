@@ -50,9 +50,10 @@ RELEVANCE_THRESHOLD = 0.30   # Gemini cosine similarity floor
 def _ocr_page(page) -> str:
     try:
         import pytesseract
-        img = page.to_image(resolution=300).original
+        img = page.to_image(resolution=150).original  # lower res = faster, less memory
         return pytesseract.image_to_string(img)
-    except Exception:
+    except Exception as e:
+        print(f"OCR failed (tesseract may not be installed): {e}", flush=True)
         return ""
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
@@ -108,8 +109,9 @@ class GeminiEmbedder:
                 norm = np.linalg.norm(vec)
                 return vec / norm if norm > 0 else vec
             except Exception as e:
-                print(f"Gemini embed error (attempt {attempt+1}): {e}", flush=True)
-                time.sleep(1)
+                print(f"Gemini embed error (attempt {attempt+1}): {type(e).__name__}: {e}", flush=True)
+                time.sleep(2 ** attempt)
+        print(f"WARNING: All Gemini attempts failed, using hash fallback for text: {text[:60]!r}", flush=True)
         return self._hash_fallback(text)
 
     def _hash_fallback(self, text: str) -> np.ndarray:
@@ -126,9 +128,11 @@ class GeminiEmbedder:
     def encode(self, texts: list, **kwargs) -> np.ndarray:
         vecs = []
         for i, text in enumerate(texts):
-            vecs.append(self._embed_one(text))
-            if i > 0 and i % 10 == 0:
-                time.sleep(0.5)
+            vec = self._embed_one(text)
+            vecs.append(vec)
+            # Rate limiting: pause every 5 requests to avoid 429
+            if (i + 1) % 5 == 0:
+                time.sleep(0.3)
         return np.array(vecs, dtype=np.float32)
 
 
@@ -248,35 +252,54 @@ def _run_pdf_job(job_id: str, filepath: Path, filename: str, machine_name: str, 
     _jobs[job_id] = {"status": "processing", "chunks": 0, "replaced": replaced, "error": None}
     try:
         texts, metas = [], []
+        print(f"PDF job {job_id}: opening file {filepath}", flush=True)
         with pdfplumber.open(filepath) as pdf:
-            print(f"PDF job {job_id}: {len(pdf.pages)} pages", flush=True)
+            total_pages = len(pdf.pages)
+            print(f"PDF job {job_id}: {total_pages} pages, starting text extraction...", flush=True)
             for page_num, page in enumerate(pdf.pages, start=1):
-                page_text = (page.extract_text() or "").strip()
-                if not page_text:
-                    page_text = _ocr_page(page).strip()
-                if not page_text:
+                try:
+                    page_text = (page.extract_text() or "").strip()
+                    if not page_text:
+                        page_text = _ocr_page(page).strip()
+                    if not page_text:
+                        continue
+                    page_chunks = list(_chunk(page_text))
+                    for chunk in page_chunks:
+                        texts.append(chunk)
+                        metas.append({
+                            "machine_name": machine_name,
+                            "source_pdf":   filename,
+                            "page_number":  page_num,
+                            "source":       "manual",
+                            "text":         chunk,
+                        })
+                    if page_num % 10 == 0 or page_num == total_pages:
+                        print(f"PDF job {job_id}: page {page_num}/{total_pages}, total chunks so far: {len(texts)}", flush=True)
+                        _jobs[job_id]["chunks"] = len(texts)
+                except Exception as page_err:
+                    print(f"PDF job {job_id}: ERROR on page {page_num}: {page_err}", flush=True)
                     continue
-                for chunk in _chunk(page_text):
-                    texts.append(chunk)
-                    metas.append({
-                        "machine_name": machine_name,
-                        "source_pdf":   filename,
-                        "page_number":  page_num,
-                        "source":       "manual",
-                        "text":         chunk,
-                    })
+        print(f"PDF job {job_id}: extraction done. {len(texts)} chunks. Now embedding in batches...", flush=True)
         if not texts:
             filepath.unlink(missing_ok=True)
             _jobs[job_id] = {"status": "error", "chunks": 0, "replaced": replaced,
                              "error": "No readable text found in PDF."}
             return
-        _embed_and_store(texts, metas)
+        # Embed and store in batches of 50 to avoid memory issues and show progress
+        BATCH = 50
+        for i in range(0, len(texts), BATCH):
+            batch_texts = texts[i:i+BATCH]
+            batch_metas = metas[i:i+BATCH]
+            print(f"PDF job {job_id}: embedding batch {i//BATCH + 1}/{(len(texts)-1)//BATCH + 1} ({len(batch_texts)} chunks)...", flush=True)
+            _embed_and_store(batch_texts, batch_metas)
+            _jobs[job_id]["chunks"] = i + len(batch_texts)
         _jobs[job_id] = {"status": "done", "chunks": len(texts), "replaced": replaced, "error": None}
         print(f"PDF job {job_id}: DONE — {len(texts)} chunks stored.", flush=True)
     except Exception as e:
-        filepath.unlink(missing_ok=True)
+        import traceback
+        err_detail = traceback.format_exc()
+        print(f"PDF job {job_id}: FATAL ERROR — {e}\n{err_detail}", flush=True)
         _jobs[job_id] = {"status": "error", "chunks": 0, "replaced": replaced, "error": str(e)}
-        print(f"PDF job {job_id}: ERROR — {e}", flush=True)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="IndustrialRAG")
@@ -408,6 +431,33 @@ def delete_excel(filename: str):
     if removed == 0 and not existed:
         raise HTTPException(404, f"'{filename}' not found")
     return {"status": "deleted", "filename": filename, "chunks_removed": removed}
+
+
+@app.post("/admin/test-pdf-parse")
+async def test_pdf_parse(file: UploadFile = File(...)):
+    """Debug endpoint: returns first 3 pages text extraction WITHOUT embedding."""
+    import io
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file")
+    results = []
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            total = len(pdf.pages)
+            for i, page in enumerate(pdf.pages[:5]):  # first 5 pages only
+                raw = (page.extract_text() or "").strip()
+                ocr_text = ""
+                if not raw:
+                    ocr_text = _ocr_page(page).strip()
+                results.append({
+                    "page": i+1,
+                    "pdfplumber_chars": len(raw),
+                    "ocr_chars": len(ocr_text),
+                    "sample": (raw or ocr_text)[:200],
+                })
+    except Exception as e:
+        raise HTTPException(500, f"PDF parse error: {e}")
+    return {"total_pages": total, "pages_sampled": len(results), "results": results}
 
 @app.delete("/admin/reset")
 def reset_all():
