@@ -264,50 +264,78 @@ _jobs: dict = {}
 def _run_pdf_job(job_id: str, filepath: Path, filename: str, machine_name: str, replaced: int):
     _jobs[job_id] = {"status": "processing", "chunks": 0, "replaced": replaced, "error": None}
     try:
-        texts, metas = [], []
-        print(f"PDF job {job_id}: opening file {filepath}", flush=True)
+        total_chunks = 0
+        print(f"PDF job {job_id}: opening {filepath}", flush=True)
         with pdfplumber.open(filepath) as pdf:
             total_pages = len(pdf.pages)
-            print(f"PDF job {job_id}: {total_pages} pages, starting text extraction...", flush=True)
+            print(f"PDF job {job_id}: {total_pages} pages — embedding page by page...", flush=True)
             for page_num, page in enumerate(pdf.pages, start=1):
                 try:
                     page_text = (page.extract_text() or "").strip()
+
+                    # Extract tables — fault codes, spec tables, alarm lists
+                    tables = page.extract_tables()
+                    if tables:
+                        for table in tables:
+                            for row in table:
+                                row_text = " | ".join(
+                                    str(cell).strip() for cell in row
+                                    if cell and str(cell).strip()
+                                )
+                                if row_text:
+                                    page_text += "\n" + row_text
+
                     if not page_text:
                         page_text = _ocr_page(page).strip()
                     if not page_text:
                         continue
-                    page_chunks = list(_chunk(page_text))
-                    for chunk in page_chunks:
-                        texts.append(chunk)
-                        metas.append({
+
+                    page_chunk_dicts = _chunk(page_text)
+                    if not page_chunk_dicts:
+                        continue
+
+                    # For backward compatibility: _chunk may return strings or dicts
+                    if isinstance(page_chunk_dicts[0], dict):
+                        texts = [c["text"] for c in page_chunk_dicts]
+                        sections = [c.get("section", "") for c in page_chunk_dicts]
+                    else:
+                        texts = page_chunk_dicts
+                        sections = [""] * len(page_chunk_dicts)
+
+                    metas = [
+                        {
                             "machine_name": machine_name,
                             "source_pdf":   filename,
                             "page_number":  page_num,
                             "source":       "manual",
-                            "text":         chunk,
-                        })
+                            "section":      sections[i],
+                            "text":         texts[i],
+                        }
+                        for i in range(len(texts))
+                    ]
+
+                    # Embed and save immediately — progress survives any restart
+                    _embed_and_store(texts, metas)
+                    total_chunks += len(texts)
+                    _jobs[job_id]["chunks"] = total_chunks
+
                     if page_num % 10 == 0 or page_num == total_pages:
-                        print(f"PDF job {job_id}: page {page_num}/{total_pages}, total chunks so far: {len(texts)}", flush=True)
-                        _jobs[job_id]["chunks"] = len(texts)
+                        print(f"PDF job {job_id}: page {page_num}/{total_pages}, "
+                              f"chunks: {total_chunks}", flush=True)
+
                 except Exception as page_err:
-                    print(f"PDF job {job_id}: ERROR on page {page_num}: {page_err}", flush=True)
+                    print(f"PDF job {job_id}: ERROR page {page_num}: {page_err}", flush=True)
                     continue
-        print(f"PDF job {job_id}: extraction done. {len(texts)} chunks. Now embedding in batches...", flush=True)
-        if not texts:
+
+        if total_chunks == 0:
             filepath.unlink(missing_ok=True)
             _jobs[job_id] = {"status": "error", "chunks": 0, "replaced": replaced,
                              "error": "No readable text found in PDF."}
             return
-        # Embed and store in batches of 50 to avoid memory issues and show progress
-        BATCH = 50
-        for i in range(0, len(texts), BATCH):
-            batch_texts = texts[i:i+BATCH]
-            batch_metas = metas[i:i+BATCH]
-            print(f"PDF job {job_id}: embedding batch {i//BATCH + 1}/{(len(texts)-1)//BATCH + 1} ({len(batch_texts)} chunks)...", flush=True)
-            _embed_and_store(batch_texts, batch_metas)
-            _jobs[job_id]["chunks"] = i + len(batch_texts)
-        _jobs[job_id] = {"status": "done", "chunks": len(texts), "replaced": replaced, "error": None}
-        print(f"PDF job {job_id}: DONE — {len(texts)} chunks stored.", flush=True)
+
+        _jobs[job_id] = {"status": "done", "chunks": total_chunks, "replaced": replaced, "error": None}
+        print(f"PDF job {job_id}: DONE — {total_chunks} chunks stored.", flush=True)
+
     except Exception as e:
         import traceback
         err_detail = traceback.format_exc()
