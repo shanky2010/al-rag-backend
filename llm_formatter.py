@@ -64,7 +64,7 @@ def _gemini(context: str, query: str, machine: str) -> Optional[str]:
         print("LLM: GEMINI_API_KEY not set, skipping.", flush=True)
         return None
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent"
         full_prompt = f"{SYSTEM_PROMPT}\n\n{_build_prompt(context, query, machine)}"
         payload = {
             "contents": [{"parts": [{"text": full_prompt}]}],
@@ -158,6 +158,28 @@ def _ollama(context: str, query: str, machine: str) -> Optional[str]:
         print(f"LLM: Ollama error: {e}", flush=True)
     return None
 
+def _groq(context: str, query: str, machine: str) -> Optional[str]:
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import groq
+        client = groq.Groq(api_key=api_key)
+        r = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",  # free & powerful
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": _build_prompt(context, query, machine)},
+            ],
+            temperature=0.0,
+            max_tokens=1500,
+        )
+        result = r.choices[0].message.content
+        print(f"LLM: Groq returned {len(result)} chars.", flush=True)
+        return result
+    except Exception as e:
+        print(f"LLM: Groq error: {e}", flush=True)
+    return None
 
 # ── 5. Rule-based fallback ────────────────────────────────────────────────────
 def _rule_based(context: str, query: str) -> str:
@@ -216,7 +238,7 @@ def generate_formatted_response(context: str, query: str, machine: str) -> str:
             "Do not attempt repairs without the official manual."
         )
 
-    for fn in [_gemini, _anthropic, _openai, _ollama]:
+    for fn in [_gemini, _anthropic, _openai, _groq, _ollama]:
         result = fn(context, query, machine)
         if result and not _is_bad(result):
             return result
