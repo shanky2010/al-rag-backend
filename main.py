@@ -44,7 +44,7 @@ for d in [PDF_DIR, EXCEL_DIR, VS_DIR]:
 EMBEDDING_DIM       = 768
 CHUNK_CHARS         = 800    # Smaller chunks = better retrieval precision
 OVERLAP_CHARS       = 150
-RELEVANCE_THRESHOLD = 0.35   # Gemini cosine similarity floor — raised to reduce noisy chunks
+RELEVANCE_THRESHOLD = 0.35   # Gemini cosine similarity floor
 
 # ── OCR fallback ──────────────────────────────────────────────────────────────
 def _ocr_page(page) -> str:
@@ -90,7 +90,16 @@ class GeminiEmbedder:
         if not self.api_key:
             print("WARNING: GEMINI_API_KEY not set. Using hash fallback.", flush=True)
 
-    def _embed_one(self, text: str) -> np.ndarray:
+    def _embed_one(self, text: str, base_delay: float = 1.2) -> np.ndarray:
+        """Embed one text with capped-backoff 429 handling.
+
+        Gemini free tier limit: ~1500 req/min sustained, but rapid bursts
+        trigger 429s immediately. Strategy:
+          - Caller already sleeps base_delay between calls (avoids burst)
+          - On 429: wait 15s flat then retry (NOT exponential — exponential
+            blows past Render's 15-min process timeout with just a few failures)
+          - Max 3 retries per chunk (45s worst case), then hash fallback
+        """
         if not self.api_key:
             return self._hash_fallback(text)
         payload = {
@@ -98,7 +107,7 @@ class GeminiEmbedder:
             "content": {"parts": [{"text": text[:8000]}]},
             "outputDimensionality": self.dim,
         }
-        for attempt in range(5):
+        for attempt in range(3):
             try:
                 resp = requests.post(
                     self.url,
@@ -107,8 +116,8 @@ class GeminiEmbedder:
                     timeout=20,
                 )
                 if resp.status_code == 429:
-                    wait = 5 * (2 ** attempt)  # 5s, 10s, 20s, 40s, 80s
-                    print(f"Gemini embed 429 — waiting {wait}s (attempt {attempt+1})", flush=True)
+                    wait = 15  # flat 15s — safe but won't blow the timeout budget
+                    print(f"Gemini embed 429 — waiting {wait}s (attempt {attempt+1}/3)", flush=True)
                     time.sleep(wait)
                     continue
                 resp.raise_for_status()
@@ -117,8 +126,9 @@ class GeminiEmbedder:
                 return vec / norm if norm > 0 else vec
             except Exception as e:
                 print(f"Gemini embed error (attempt {attempt+1}): {type(e).__name__}: {e}", flush=True)
-                time.sleep(3 * (attempt + 1))
-        print(f"WARNING: All Gemini attempts failed, using hash fallback for: {text[:60]!r}", flush=True)
+                if attempt < 2:
+                    time.sleep(5)
+        print(f"WARNING: Gemini failed after 3 attempts, using hash fallback for: {text[:60]!r}", flush=True)
         return self._hash_fallback(text)
 
     def _hash_fallback(self, text: str) -> np.ndarray:
@@ -133,13 +143,20 @@ class GeminiEmbedder:
         return vec / norm if norm > 0 else vec
 
     def encode(self, texts: list, **kwargs) -> np.ndarray:
+        """Embed a list of texts at a safe rate for Gemini free tier.
+
+        1.2s between requests = ~50 req/min, well under the burst threshold.
+        For 179 chunks: ~3.6 min total embedding time — fits Render's 15-min limit.
+        Every 50 chunks we pause 5s to let the quota window reset.
+        """
         vecs = []
         for i, text in enumerate(texts):
             vec = self._embed_one(text)
             vecs.append(vec)
-            # Gemini free tier: ~1500 req/min but bursts trigger 429
-            # Sleep 0.5s every request = max 120/min = safe
-            time.sleep(0.5)
+            time.sleep(1.2)            # 50 req/min — avoids burst 429s
+            if (i + 1) % 50 == 0:     # extra 5s cooldown every 50 chunks
+                print(f"Embedder: {i+1}/{len(texts)} chunks done — brief cooldown...", flush=True)
+                time.sleep(5)
         return np.array(vecs, dtype=np.float32)
 
 
