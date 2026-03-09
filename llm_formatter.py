@@ -8,51 +8,75 @@ import os
 import requests
 from typing import Optional
 
-SYSTEM_PROMPT = """You are an expert industrial maintenance assistant for Ashok Leyland.
+SYSTEM_PROMPT = """You are an expert industrial maintenance assistant for Ashok Leyland vehicles and equipment.
 
-A technician has queried the system and retrieved relevant excerpts from machine manuals and repair logs. Your job is to read those excerpts carefully and produce a clear, well-written maintenance response.
+A technician has queried the system and relevant excerpts have been retrieved from machine manuals and repair logs. Your job is to synthesize those excerpts into a clear, actionable maintenance response.
 
-RULES:
-- Use ONLY information present in the provided CONTEXT.
-- Write in complete, natural sentences — not raw fragments or copied text.
-- If the context does not contain enough information for a section, write: "Not found in the manual."
-- Do NOT invent causes, steps, or warnings not present in the context.
-- If the context is completely irrelevant to the query, respond only with: INSUFFICIENT_CONTEXT
+STRICT RULES — FOLLOW EXACTLY:
+1. Use ONLY information present in the CONTEXT below. Do NOT add any knowledge from outside the context.
+2. Write in complete, natural sentences. Do NOT copy raw fragments verbatim.
+3. If insufficient information exists for a section, write exactly: "Not found in the manual."
+4. Do NOT invent or assume causes, steps, or warnings that are not clearly stated in the context.
+5. If the ENTIRE context is irrelevant to the query, respond with only: INSUFFICIENT_CONTEXT
+6. You MUST use EXACTLY these four headings on their own lines, followed immediately by content on the next line.
 
-OUTPUT FORMAT (use exactly these four headings, nothing else):
+OUTPUT FORMAT — MANDATORY:
 
 PROBLEM SUMMARY:
-[2-3 sentences describing what the manual says about this fault or issue]
+[2-3 sentences describing what the manual/logs say about this fault or issue]
 
 POSSIBLE CAUSES:
-1. [Cause from context, written as a clear sentence]
-2. [Next cause, if present]
+1. [First cause from context]
+2. [Second cause, if present]
 
 STEP-BY-STEP CORRECTIVE ACTIONS:
-1. [First action from context, written as a clear instruction]
-2. [Next step]
+1. [First action from context]
+2. [Second action]
 
 SAFETY NOTES:
-[Any warnings, cautions or danger notices from the context. If none, write "None stated in manual."]"""
+[Safety warnings or cautions from the context. If none, write: None stated in manual.]"""
 
 
 def _build_prompt(context: str, query: str, machine: str) -> str:
+    # Deduplicate context blocks (same text appearing from multiple chunks)
+    seen = set()
+    deduped_parts = []
+    for block in context.split("\n---\n"):
+        block = block.strip()
+        if not block:
+            continue
+        # Use first 120 chars as a fingerprint to deduplicate near-identical chunks
+        fingerprint = block[:120].lower().replace(" ", "")
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            deduped_parts.append(block)
+
+    deduped_context = "\n\n---\n\n".join(deduped_parts)
+
     return (
         f"MACHINE: {machine}\n"
         f"TECHNICIAN QUERY: {query}\n\n"
         "CONTEXT (retrieved from uploaded manuals and repair logs):\n"
-        "---\n"
-        f"{context}\n"
-        "---\n\n"
-        "Using ONLY the context above, write the structured maintenance response. "
-        "Rewrite all information in clear, complete sentences — do not copy raw fragments."
+        "════════════════════════════════════════\n"
+        f"{deduped_context}\n"
+        "════════════════════════════════════════\n\n"
+        "Using ONLY the context above, produce the structured maintenance response. "
+        "Rewrite information in clear, complete sentences — do not copy raw text fragments. "
+        "Every section must be grounded in the context. "
+        "If a section has no relevant information, write: Not found in the manual."
     )
 
 
 def _is_bad(text: str) -> bool:
-    if not text or len(text.strip()) < 30:
+    if not text or len(text.strip()) < 50:
         return True
-    if "INSUFFICIENT_CONTEXT" in text.upper():
+    t = text.upper()
+    if "INSUFFICIENT_CONTEXT" in t:
+        return True
+    # Must contain at least two of the four expected section headers
+    headers = ["PROBLEM SUMMARY", "POSSIBLE CAUSES", "CORRECTIVE ACTION", "SAFETY"]
+    found = sum(1 for h in headers if h in t)
+    if found < 2:
         return True
     return False
 
@@ -98,7 +122,7 @@ def _anthropic(context: str, query: str, machine: str) -> Optional[str]:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-haiku-4-5",
             max_tokens=1500,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": _build_prompt(context, query, machine)}],

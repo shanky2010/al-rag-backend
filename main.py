@@ -44,7 +44,7 @@ for d in [PDF_DIR, EXCEL_DIR, VS_DIR]:
 EMBEDDING_DIM       = 768
 CHUNK_CHARS         = 800    # Smaller chunks = better retrieval precision
 OVERLAP_CHARS       = 150
-RELEVANCE_THRESHOLD = 0.30   # Gemini cosine similarity floor
+RELEVANCE_THRESHOLD = 0.35   # Gemini cosine similarity floor — raised to reduce noisy chunks
 
 # ── OCR fallback ──────────────────────────────────────────────────────────────
 def _ocr_page(page) -> str:
