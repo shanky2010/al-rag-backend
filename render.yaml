@@ -10,13 +10,15 @@ services:
       mountPath: /data
       sizeGB: 1
     envVars:
-      - key: USE_OLLAMA
-        value: "false"
       - key: DATA_DIR
         value: "/data"
       - key: RENDER_EXTERNAL_URL
         value: "https://al-rag-backend.onrender.com"
+      - key: USE_OLLAMA
+        value: "false"
+      - key: GEMINI_API_KEY
+        sync: false
       - key: ANTHROPIC_API_KEY
         sync: false
-      - key: GEMINI_API_KEY
+      - key: GROQ_API_KEY
         sync: false

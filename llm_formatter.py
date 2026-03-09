@@ -136,7 +136,33 @@ def _openai(context: str, query: str, machine: str) -> Optional[str]:
     return None
 
 
-# ── 4. Ollama (local only) ────────────────────────────────────────────────────
+
+# ── 4. Groq (free, fast — Mistral/Llama hosted) ───────────────────────────────
+def _groq(context: str, query: str, machine: str) -> Optional[str]:
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import groq as groq_lib
+        client = groq_lib.Groq(api_key=api_key)
+        r = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": _build_prompt(context, query, machine)},
+            ],
+            temperature=0.0,
+            max_tokens=1500,
+        )
+        result = r.choices[0].message.content
+        print(f"LLM: Groq returned {len(result)} chars.", flush=True)
+        return result
+    except Exception as e:
+        print(f"LLM: Groq error: {e}", flush=True)
+    return None
+
+
+# ── 5. Ollama (local only) ────────────────────────────────────────────────────
 def _ollama(context: str, query: str, machine: str) -> Optional[str]:
     if os.environ.get("USE_OLLAMA", "false").lower() != "true":
         return None
@@ -158,28 +184,6 @@ def _ollama(context: str, query: str, machine: str) -> Optional[str]:
         print(f"LLM: Ollama error: {e}", flush=True)
     return None
 
-def _groq(context: str, query: str, machine: str) -> Optional[str]:
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        return None
-    try:
-        import groq
-        client = groq.Groq(api_key=api_key)
-        r = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",  # free & powerful
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": _build_prompt(context, query, machine)},
-            ],
-            temperature=0.0,
-            max_tokens=1500,
-        )
-        result = r.choices[0].message.content
-        print(f"LLM: Groq returned {len(result)} chars.", flush=True)
-        return result
-    except Exception as e:
-        print(f"LLM: Groq error: {e}", flush=True)
-    return None
 
 # ── 5. Rule-based fallback ────────────────────────────────────────────────────
 def _rule_based(context: str, query: str) -> str:
