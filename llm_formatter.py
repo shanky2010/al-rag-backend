@@ -1,51 +1,96 @@
 """
 IndustrialRAG - LLM Formatting Layer
-Priority on Render: Anthropic → OpenAI → Ollama (local) → rule-based fallback
-Strict grounding: never hallucinate beyond the retrieved context.
+Primary: Google Gemini Flash (free, same key as embeddings)
+Fallback: Anthropic → OpenAI → Ollama → rule-based
 """
 
 import os
+import requests
 from typing import Optional
 
-SYSTEM_PROMPT = """You are an industrial maintenance assistant. Your ONLY job is to extract and structure information from the provided CONTEXT.
+SYSTEM_PROMPT = """You are an expert industrial maintenance assistant for Ashok Leyland.
 
-STRICT RULES:
-1. Use ONLY information explicitly present in the CONTEXT.
-2. If a section has no relevant info, write: "Not found in manual."
-3. Do NOT use general knowledge. Do NOT guess. Do NOT infer beyond what is written.
-4. If the context is completely unrelated to the query, respond only with: INSUFFICIENT_CONTEXT
+A technician has queried the system and retrieved relevant excerpts from machine manuals and repair logs. Your job is to read those excerpts carefully and produce a clear, well-written maintenance response.
 
-Output format (use exactly, no deviations):
+RULES:
+- Use ONLY information present in the provided CONTEXT.
+- Write in complete, natural sentences — not raw fragments or copied text.
+- If the context does not contain enough information for a section, write: "Not found in the manual."
+- Do NOT invent causes, steps, or warnings not present in the context.
+- If the context is completely irrelevant to the query, respond only with: INSUFFICIENT_CONTEXT
+
+OUTPUT FORMAT (use exactly these four headings, nothing else):
+
 PROBLEM SUMMARY:
-[What the context says about this issue]
+[2-3 sentences describing what the manual says about this fault or issue]
 
 POSSIBLE CAUSES:
-1. [cause from context]
+1. [Cause from context, written as a clear sentence]
+2. [Next cause, if present]
 
 STEP-BY-STEP CORRECTIVE ACTIONS:
-1. [step from context]
+1. [First action from context, written as a clear instruction]
+2. [Next step]
 
 SAFETY NOTES:
-[warnings from context, or "None stated in manual."]"""
+[Any warnings, cautions or danger notices from the context. If none, write "None stated in manual."]"""
 
 
-def _prompt(context: str, query: str) -> str:
+def _build_prompt(context: str, query: str, machine: str) -> str:
     return (
-        "CONTEXT (from uploaded manual/repair logs only):\n"
-        "===\n"
+        f"MACHINE: {machine}\n"
+        f"TECHNICIAN QUERY: {query}\n\n"
+        "CONTEXT (retrieved from uploaded manuals and repair logs):\n"
+        "---\n"
         f"{context}\n"
-        "===\n\n"
-        f"Technician query: {query}\n\n"
-        "Using ONLY the context above, provide the structured response."
+        "---\n\n"
+        "Using ONLY the context above, write the structured maintenance response. "
+        "Rewrite all information in clear, complete sentences — do not copy raw fragments."
     )
 
 
 def _is_bad(text: str) -> bool:
-    return not text or "INSUFFICIENT_CONTEXT" in text.upper()
+    if not text or len(text.strip()) < 30:
+        return True
+    if "INSUFFICIENT_CONTEXT" in text.upper():
+        return True
+    return False
 
 
-# ── 1. Anthropic (Claude Haiku) — PRIMARY on Render ──────────────────────────
-def _anthropic(context: str, query: str) -> Optional[str]:
+# ── 1. Gemini Flash — PRIMARY (free, same key as embeddings) ──────────────────
+def _gemini(context: str, query: str, machine: str) -> Optional[str]:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("LLM: GEMINI_API_KEY not set, skipping.", flush=True)
+        return None
+    try:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        full_prompt = f"{SYSTEM_PROMPT}\n\n{_build_prompt(context, query, machine)}"
+        payload = {
+            "contents": [{"parts": [{"text": full_prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 1500,
+            }
+        }
+        resp = requests.post(
+            url,
+            params={"key": api_key},
+            json=payload,
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        result = data["candidates"][0]["content"]["parts"][0]["text"]
+        print(f"LLM: Gemini Flash returned {len(result)} chars.", flush=True)
+        return result
+    except Exception as e:
+        print(f"LLM: Gemini error: {e}", flush=True)
+    return None
+
+
+# ── 2. Anthropic (Claude Haiku) — fallback if credits available ───────────────
+def _anthropic(context: str, query: str, machine: str) -> Optional[str]:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
@@ -54,18 +99,20 @@ def _anthropic(context: str, query: str) -> Optional[str]:
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
+            max_tokens=1500,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": _prompt(context, query)}],
+            messages=[{"role": "user", "content": _build_prompt(context, query, machine)}],
         )
-        return msg.content[0].text
+        result = msg.content[0].text
+        print(f"LLM: Anthropic returned {len(result)} chars.", flush=True)
+        return result
     except Exception as e:
-        print(f"Anthropic error: {e}")
+        print(f"LLM: Anthropic error: {e}", flush=True)
     return None
 
 
-# ── 2. OpenAI — fallback if Anthropic key missing ────────────────────────────
-def _openai(context: str, query: str) -> Optional[str]:
+# ── 3. OpenAI ─────────────────────────────────────────────────────────────────
+def _openai(context: str, query: str, machine: str) -> Optional[str]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -76,69 +123,74 @@ def _openai(context: str, query: str) -> Optional[str]:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": _prompt(context, query)},
+                {"role": "user",   "content": _build_prompt(context, query, machine)},
             ],
             temperature=0.0,
-            max_tokens=1024,
+            max_tokens=1500,
         )
-        return r.choices[0].message.content
+        result = r.choices[0].message.content
+        print(f"LLM: OpenAI returned {len(result)} chars.", flush=True)
+        return result
     except Exception as e:
-        print(f"OpenAI error: {e}")
+        print(f"LLM: OpenAI error: {e}", flush=True)
     return None
 
 
-# ── 3. Ollama — local only, skipped on Render ────────────────────────────────
-def _ollama(context: str, query: str) -> Optional[str]:
+# ── 4. Ollama (local only) ────────────────────────────────────────────────────
+def _ollama(context: str, query: str, machine: str) -> Optional[str]:
     if os.environ.get("USE_OLLAMA", "false").lower() != "true":
         return None
     try:
-        import requests
         r = requests.post(
             "http://localhost:11434/api/generate",
             json={
                 "model":   os.environ.get("OLLAMA_MODEL", "mistral"),
-                "prompt":  _prompt(context, query),
+                "prompt":  _build_prompt(context, query, machine),
                 "system":  SYSTEM_PROMPT,
                 "stream":  False,
-                "options": {"temperature": 0.0, "num_predict": 1024},
+                "options": {"temperature": 0.0, "num_predict": 1500},
             },
             timeout=120,
         )
         if r.status_code == 200:
             return r.json().get("response", "")
     except Exception as e:
-        print(f"Ollama error: {e}")
+        print(f"LLM: Ollama error: {e}", flush=True)
     return None
 
 
-# ── 4. Rule-based — no LLM needed, zero cost ─────────────────────────────────
+# ── 5. Rule-based fallback ────────────────────────────────────────────────────
 def _rule_based(context: str, query: str) -> str:
-    lines = [
+    print("LLM: Using rule-based fallback.", flush=True)
+    sentences = [
         ln.strip() for ln in context.split("\n")
-        if ln.strip() and not ln.strip().startswith("[")
+        if len(ln.strip()) > 20 and not ln.strip().startswith("[")
     ]
     cause_kw = ["cause", "caused by", "due to", "failure", "fault", "defect",
-                "worn", "damaged", "failed", "broken", "loose", "blocked", "missing"]
+                "worn", "damaged", "failed", "broken", "loose", "blocked", "missing",
+                "low battery", "obstacle", "emergency stop", "not pressed", "is off"]
     fix_kw   = ["replace", "check", "verify", "inspect", "clean", "adjust",
                 "tighten", "reset", "test", "turn off", "turn on", "connect",
-                "disconnect", "press", "ensure", "remove", "install", "lubricate", "charge"]
+                "disconnect", "press", "ensure", "remove", "install", "lubricate",
+                "charge", "release", "restart", "de-energize", "switch"]
     warn_kw  = ["warning", "caution", "danger", "do not", "must not", "hazard",
-                "electric", "shock", "fire", "risk", "never"]
+                "electric", "shock", "fire", "risk", "never", "only perform",
+                "trained electrician"]
 
-    causes, fixes, warnings = [], [], []
-    for line in lines:
-        low = line.lower()
+    causes, fixes, warnings, summary = [], [], [], []
+    for s in sentences:
+        low = s.lower()
         if any(k in low for k in warn_kw) and len(warnings) < 3:
-            warnings.append(line[:250])
+            warnings.append(s[:300])
         elif any(k in low for k in cause_kw) and len(causes) < 5:
-            causes.append(line[:250])
+            causes.append(s[:300])
         elif any(k in low for k in fix_kw) and len(fixes) < 7:
-            fixes.append(line[:250])
+            fixes.append(s[:300])
+        elif len(summary) < 2:
+            summary.append(s[:300])
 
-    has_content = bool(causes or fixes)
     out  = "PROBLEM SUMMARY:\n"
-    out += (f'Information found in the manual regarding "{query}".\n' if has_content
-            else f'No direct match for "{query}" in the retrieved pages.\n')
+    out += (" ".join(summary) + "\n") if summary else "Limited information found in the retrieved pages.\n"
     out += "\nPOSSIBLE CAUSES:\n"
     out += "".join(f"{i}. {c}\n" for i, c in enumerate(causes, 1)) or "1. Not found in manual.\n"
     out += "\nSTEP-BY-STEP CORRECTIVE ACTIONS:\n"
@@ -150,16 +202,10 @@ def _rule_based(context: str, query: str) -> str:
 
 # ── Main entry ────────────────────────────────────────────────────────────────
 def generate_formatted_response(context: str, query: str, machine: str) -> str:
-    """
-    Priority: Anthropic → OpenAI → Ollama → rule-based.
-    On Render: set ANTHROPIC_API_KEY env var → uses Claude Haiku (~$0.01/query).
-    Locally: set USE_OLLAMA=true → uses Mistral via Ollama.
-    Always falls back to rule-based — never crashes.
-    """
     if not context.strip():
         return (
             "PROBLEM SUMMARY:\n"
-            f'No relevant content retrieved from the manual for "{query}" on {machine}.\n\n'
+            f'No relevant content was found in the indexed manuals for "{query}" on {machine}.\n\n'
             "POSSIBLE CAUSES:\n"
             "1. Not found in manual.\n\n"
             "STEP-BY-STEP CORRECTIVE ACTIONS:\n"
@@ -170,8 +216,8 @@ def generate_formatted_response(context: str, query: str, machine: str) -> str:
             "Do not attempt repairs without the official manual."
         )
 
-    for fn in [_anthropic, _openai, _ollama]:
-        result = fn(context, query)
+    for fn in [_gemini, _anthropic, _openai, _ollama]:
+        result = fn(context, query, machine)
         if result and not _is_bad(result):
             return result
 
