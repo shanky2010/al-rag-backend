@@ -5,6 +5,7 @@ Fallback: Anthropic → OpenAI → Ollama → rule-based
 """
 
 import os
+import time
 import requests
 from typing import Optional
 
@@ -63,29 +64,36 @@ def _gemini(context: str, query: str, machine: str) -> Optional[str]:
     if not api_key:
         print("LLM: GEMINI_API_KEY not set, skipping.", flush=True)
         return None
-    try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-        full_prompt = f"{SYSTEM_PROMPT}\n\n{_build_prompt(context, query, machine)}"
-        payload = {
-            "contents": [{"parts": [{"text": full_prompt}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 1500,
-            }
-        }
-        resp = requests.post(
-            url,
-            params={"key": api_key},
-            json=payload,
-            timeout=30
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        result = data["candidates"][0]["content"]["parts"][0]["text"]
-        print(f"LLM: Gemini Flash returned {len(result)} chars.", flush=True)
-        return result
-    except Exception as e:
-        print(f"LLM: Gemini error: {e}", flush=True)
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{_build_prompt(context, query, machine)}"
+    payload = {
+        "contents": [{"parts": [{"text": full_prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1500}
+    }
+
+    # Retry up to 4 times with increasing delay on 429
+    for attempt in range(4):
+        try:
+            resp = requests.post(
+                url, params={"key": api_key}, json=payload, timeout=30
+            )
+            if resp.status_code == 429:
+                wait = 15 * (attempt + 1)  # 15s, 30s, 45s, 60s
+                print(f"LLM: Gemini 429 rate limit, waiting {wait}s (attempt {attempt+1}/4)...", flush=True)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data   = resp.json()
+            result = data["candidates"][0]["content"]["parts"][0]["text"]
+            print(f"LLM: Gemini Flash returned {len(result)} chars.", flush=True)
+            return result
+        except Exception as e:
+            print(f"LLM: Gemini attempt {attempt+1} error: {e}", flush=True)
+            if attempt < 3:
+                time.sleep(5)
+
+    print("LLM: Gemini exhausted all retries.", flush=True)
     return None
 
 
