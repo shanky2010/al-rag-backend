@@ -1,206 +1,113 @@
 """
 IndustrialRAG - FastAPI Backend
-Clean rewrite — stable, production ready
+Memory-efficient version for Render free tier (512MB RAM)
+- Gemini semantic embeddings (768-dim)
+- Page-by-page PDF processing (low peak RAM)
+- Background threading for uploads
 """
 
-import os
-import re
-import shutil
-import hashlib
-import time
-import threading
-import pickle
+import os, shutil, hashlib, threading, uuid, time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import faiss
+import pickle
 import requests
-import pdfplumber
-import pandas as pd
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+import pdfplumber
 import sys
 sys.path.append(str(Path(__file__).parent))
 from llm_formatter import generate_formatted_response
+import pandas as pd
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
-DATA_DIR   = Path(os.environ.get("DATA_DIR", str(BASE_DIR)))
-PDF_DIR    = DATA_DIR / "uploads" / "pdfs"
-EXCEL_DIR  = DATA_DIR / "uploads" / "excels"
-VS_DIR     = DATA_DIR / "vectorstore"
+PDF_DIR    = BASE_DIR / "uploads" / "pdfs"
+EXCEL_DIR  = BASE_DIR / "uploads" / "excels"
+VS_DIR     = BASE_DIR / "vectorstore"
 INDEX_PATH = VS_DIR / "index.faiss"
 META_PATH  = VS_DIR / "metadata.pkl"
 
 for d in [PDF_DIR, EXCEL_DIR, VS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-EMBEDDING_DIM       = 384    # all-MiniLM-L6-v2 — 90MB, fits Render free tier (512MB limit)
-CHUNK_CHARS         = 600    # Smaller = one procedure per chunk = precise retrieval
-OVERLAP_CHARS       = 120
-RELEVANCE_THRESHOLD = 0.35   # cosine similarity floor for MiniLM
+# ── Config ─────────────────────────────────────────────────────────────────────
+EMBEDDING_DIM       = 768
+CHUNK_CHARS         = 2400
+OVERLAP_CHARS       = 400
+RELEVANCE_THRESHOLD = 0.55
+EMBED_BATCH_SIZE    = 5   # embed N chunks at a time to keep RAM low
 
-# ── OCR fallback ──────────────────────────────────────────────────────────────
-def _ocr_page(page) -> str:
-    try:
-        import pytesseract
-        img = page.to_image(resolution=150).original
-        return pytesseract.image_to_string(img)
-    except Exception as e:
-        print(f"OCR failed: {e}", flush=True)
-        return ""
-
-# ── Chunking ──────────────────────────────────────────────────────────────────
-def _chunk(text: str) -> list:
-    # Strip image/drawing reference codes and page header noise
-    text = re.sub(r'[A-Z]{2}\d{11,}', '', text)
-    text = re.sub(r'5247-E\s+P-[\w().-]+', '', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    text = re.sub(r'[ \t]+', ' ', text).strip()
-
-    # Detect section headers to prepend to each chunk
-    # This tells the LLM exactly which part of the manual each chunk comes from
-    header_re = re.compile(
-        r'^((?:CHAPTER|SECTION|PART|WARNING|CAUTION|NOTE|PROCEDURE|'
-        r'MAINTENANCE|TROUBLESHOOT|ALARM|ERROR|FAULT|SAFETY|'
-        r'\d+[\.\d]*)\s*[:\-]?\s*.{0,60})$',
-        re.MULTILINE | re.IGNORECASE
-    )
-    section = ""
-    m = header_re.search(text)
-    if m:
-        section = m.group(1).strip()
-
-    out, start = [], 0
-    while start < len(text):
-        end = min(start + CHUNK_CHARS, len(text))
-        if end < len(text):
-            for sep in ['\n\n', '.\n', '. ', ';\n', '; ']:
-                pos = text.rfind(sep, start + int(CHUNK_CHARS * 0.4), end)
-                if pos != -1:
-                    end = pos + len(sep)
-                    break
-
-        raw = text[start:end].strip()
-
-        # Update section if this chunk opens a new one
-        nm = header_re.search(raw)
-        if nm:
-            section = nm.group(1).strip()
-
-        # Prepend section so LLM knows context of every chunk
-        chunk_text = f"[Section: {section}]\n{raw}" if section and not raw.startswith(section) else raw
-
-        if len(raw) > 60:
-            out.append(chunk_text)
-
-        if end >= len(text):
-            break
-        start = end - OVERLAP_CHARS
-
-    return out
-
-# ── Local Embedder: all-MiniLM-L6-v2 via ONNX Runtime ────────────────────────
-# Why ONNX instead of sentence-transformers + PyTorch:
-#   - PyTorch alone uses ~350MB RAM on import — blows Render free tier (512MB)
-#   - onnxruntime-cpu uses ~40MB RAM for the same model
-#   - Same model, same 384-dim vectors, same cosine similarity quality
-#   - No GPU dependencies, no CUDA packages, pure CPU inference
-#   - model downloaded once from HuggingFace on first startup (~90MB)
-
-class LocalEmbedder:
+# ── Gemini Embedder ────────────────────────────────────────────────────────────
+class GeminiEmbedder:
+    """Semantic embedder via Gemini embedding-001. ~0MB RAM (API-based)."""
     def __init__(self):
-        self.dim     = EMBEDDING_DIM
-        self.session = None
-        self.tokenizer = None
-        self._load()
+        self.api_key = os.environ.get("GEMINI_API_KEY", "")
+        self.url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
+        self.dim = EMBEDDING_DIM
 
-    def _load(self):
-        try:
-            from tokenizers import Tokenizer
-            import onnxruntime as ort
-            from huggingface_hub import hf_hub_download
-            import json
-
-            print("Downloading MiniLM ONNX model from HuggingFace...", flush=True)
-
-            # Download ONNX model and tokenizer from HuggingFace
-            model_path     = hf_hub_download("sentence-transformers/all-MiniLM-L6-v2",
-                                              filename="onnx/model.onnx")
-            tokenizer_path = hf_hub_download("sentence-transformers/all-MiniLM-L6-v2",
-                                              filename="tokenizer.json")
-
-            self.tokenizer = Tokenizer.from_file(tokenizer_path)
-            self.tokenizer.enable_padding(pad_id=0, pad_token="[PAD]", length=128)
-            self.tokenizer.enable_truncation(max_length=128)
-
-            opts = ort.SessionOptions()
-            opts.inter_op_num_threads = 1
-            opts.intra_op_num_threads = 1
-            self.session = ort.InferenceSession(model_path, sess_options=opts,
-                                                providers=["CPUExecutionProvider"])
-            print("Embedder ready — MiniLM ONNX loaded (~40MB RAM).", flush=True)
-
-        except Exception as e:
-            print(f"WARNING: ONNX load failed: {e}. Using hash fallback.", flush=True)
-            self.session  = None
-            self.tokenizer = None
-
-    def encode(self, texts: list, is_query: bool = False, **kwargs) -> np.ndarray:
-        if self.session is None or self.tokenizer is None:
-            return np.array([self._hash_fallback(t) for t in texts], dtype=np.float32)
-
-        BATCH = 32
-        all_vecs = []
-        for i in range(0, len(texts), BATCH):
-            batch = texts[i:i+BATCH]
-            encoded = self.tokenizer.encode_batch(batch)
-            input_ids      = np.array([e.ids              for e in encoded], dtype=np.int64)
-            attention_mask = np.array([e.attention_mask   for e in encoded], dtype=np.int64)
-            token_type_ids = np.array([[0]*len(e.ids)     for e in encoded], dtype=np.int64)
-
-            outputs = self.session.run(None, {
-                "input_ids":      input_ids,
-                "attention_mask": attention_mask,
-                "token_type_ids": token_type_ids,
-            })
-
-            # Mean pooling over token embeddings, weighted by attention mask
-            token_embeddings = outputs[0]  # (batch, seq_len, hidden)
-            mask = attention_mask[:, :, np.newaxis].astype(np.float32)
-            summed = (token_embeddings * mask).sum(axis=1)
-            counts = mask.sum(axis=1).clip(min=1e-9)
-            mean_pooled = summed / counts
-
-            # L2 normalize
-            norms = np.linalg.norm(mean_pooled, axis=1, keepdims=True).clip(min=1e-9)
-            all_vecs.append((mean_pooled / norms).astype(np.float32))
-
-        return np.vstack(all_vecs)
+    def _embed_one(self, text: str) -> Optional[np.ndarray]:
+        if not self.api_key:
+            return None
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    self.url,
+                    params={"key": self.api_key},
+                    json={"model": "models/gemini-embedding-001",
+                          "content": {"parts": [{"text": text[:8000]}]},
+                          "outputDimensionality": self.dim},
+                    timeout=20
+                )
+                if resp.status_code == 429:
+                    time.sleep(2 ** attempt)
+                    continue
+                resp.raise_for_status()
+                vals = resp.json()["embedding"]["values"]
+                vec = np.array(vals[:self.dim], dtype=np.float32)
+                norm = np.linalg.norm(vec)
+                return vec / norm if norm > 0 else vec
+            except Exception as e:
+                print(f"Gemini embed attempt {attempt+1} failed: {e}", flush=True)
+                time.sleep(1)
+        return None
 
     def _hash_fallback(self, text: str) -> np.ndarray:
-        tokens = re.findall(r'[a-z0-9]+', text.lower())
-        bigrams = [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens)-1)]
         vec = np.zeros(self.dim, dtype=np.float32)
-        for token in tokens + bigrams:
-            h = int(hashlib.md5(token.encode()).hexdigest(), 16)
+        import re
+        tokens = re.findall(r'[a-z0-9]+', text.lower())
+        for t in tokens:
+            h = int(hashlib.md5(t.encode()).hexdigest(), 16)
             vec[h % self.dim] += 1.0
-        vec = np.sign(vec) * np.log1p(np.abs(vec))
         norm = np.linalg.norm(vec)
         return vec / norm if norm > 0 else vec
 
+    def encode(self, texts: list) -> np.ndarray:
+        results = []
+        for i, text in enumerate(texts):
+            vec = self._embed_one(text)
+            if vec is None:
+                vec = self._hash_fallback(text)
+            results.append(vec)
+            # Rate limit: small sleep every 10 requests
+            if (i + 1) % 10 == 0:
+                time.sleep(0.5)
+        return np.array(results, dtype=np.float32)
 
-print("Initializing ONNX embedder...", flush=True)
-embedder = LocalEmbedder()
+print("Initializing Gemini embedder...", flush=True)
+embedder = GeminiEmbedder()
 print("Embedder ready.", flush=True)
 
-# ── FAISS Index ───────────────────────────────────────────────────────────────
+# ── FAISS index ────────────────────────────────────────────────────────────────
+_index_lock = threading.Lock()
+
 def _make_index():
     return faiss.IndexIDMap(faiss.IndexFlatIP(EMBEDDING_DIM))
 
@@ -208,13 +115,15 @@ def _load_index():
     if INDEX_PATH.exists() and META_PATH.exists():
         try:
             loaded = faiss.read_index(str(INDEX_PATH))
+            # Check dimension match
+            inner = loaded.index if hasattr(loaded, 'index') else loaded
+            if hasattr(inner, 'd') and inner.d != EMBEDDING_DIM:
+                print(f"WARNING: Index dim {inner.d} != {EMBEDDING_DIM}. Wiping.", flush=True)
+                return _make_index(), {}
             with open(META_PATH, "rb") as f:
                 meta = pickle.load(f)
             if isinstance(meta, list):
                 meta = {i: m for i, m in enumerate(meta)}
-            if loaded.d != EMBEDDING_DIM:
-                print(f"WARNING: Index dim mismatch. Resetting.", flush=True)
-                return _make_index(), {}
             print(f"Loaded index with {loaded.ntotal} chunks.", flush=True)
             return loaded, meta
         except Exception as e:
@@ -223,7 +132,6 @@ def _load_index():
 
 index, metadata_store = _load_index()
 _id_counter = max(metadata_store.keys(), default=-1) + 1
-_index_lock = threading.Lock()
 
 def _next_id():
     global _id_counter
@@ -237,39 +145,149 @@ def _save():
         pickle.dump(metadata_store, f)
 
 def _embed_and_store(texts: list, metas: list):
+    """Embed in small batches and store immediately to keep RAM low."""
     if not texts:
         return
-    vecs = embedder.encode(texts)
-    ids  = [_next_id() for _ in texts]
-    with _index_lock:
-        index.add_with_ids(np.array(vecs, dtype="float32"), np.array(ids, dtype="int64"))
-        for vid, meta in zip(ids, metas):
-            metadata_store[vid] = meta
-        _save()
-
-def _remove_by_source(source_pdf=None, source_excel=None) -> int:
-    to_remove = [
-        vid for vid, meta in list(metadata_store.items())
-        if (source_pdf   and meta.get("source_pdf")   == source_pdf) or
-           (source_excel and meta.get("source_excel") == source_excel)
-    ]
-    if to_remove:
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch_texts = texts[i:i+EMBED_BATCH_SIZE]
+        batch_metas = metas[i:i+EMBED_BATCH_SIZE]
+        vecs = embedder.encode(batch_texts)
         with _index_lock:
+            ids = [_next_id() for _ in batch_texts]
+            index.add_with_ids(
+                np.array(vecs, dtype="float32"),
+                np.array(ids, dtype="int64")
+            )
+            for vid, meta in zip(ids, batch_metas):
+                metadata_store[vid] = meta
+            _save()
+
+def _remove_by_source(source_pdf=None, source_excel=None):
+    with _index_lock:
+        to_remove = []
+        for vid, meta in list(metadata_store.items()):
+            if source_pdf   and meta.get("source_pdf")   == source_pdf:   to_remove.append(vid)
+            if source_excel and meta.get("source_excel") == source_excel: to_remove.append(vid)
+        if to_remove:
             index.remove_ids(np.array(to_remove, dtype="int64"))
             for vid in to_remove:
                 del metadata_store[vid]
             _save()
     return len(to_remove)
 
-def _retrieve(query: str, machine: str, top_manual=5, top_log=3) -> list:
-    if index.ntotal == 0:
-        return []
-    q_vec = embedder.encode([query])
-    k = min(index.ntotal, (top_manual + top_log) * 15)
-    scores, ids = index.search(np.array(q_vec, dtype="float32"), k)
-    print(f"RETRIEVE query='{query[:50]}' machine='{machine}' "
-          f"top5={[round(float(s),3) for s in scores[0][:5]]} threshold={RELEVANCE_THRESHOLD}",
-          flush=True)
+def _chunk(text: str) -> list:
+    out, start = [], 0
+    while start < len(text):
+        end   = min(start + CHUNK_CHARS, len(text))
+        chunk = text[start:end].strip()
+        if len(chunk) > 60:
+            out.append(chunk)
+        if end == len(text):
+            break
+        start += CHUNK_CHARS - OVERLAP_CHARS
+    return out
+
+def _ocr_page(page):
+    try:
+        import pytesseract
+        img = page.to_image(resolution=150).original  # lower res = less RAM
+        return pytesseract.image_to_string(img)
+    except Exception:
+        return ""
+
+# ── Background job tracking ────────────────────────────────────────────────────
+_jobs: dict = {}
+_jobs_lock  = threading.Lock()
+
+def _set_job(job_id, status, detail="", chunks=0):
+    with _jobs_lock:
+        _jobs[job_id] = {"status": status, "detail": detail, "chunks": chunks}
+
+def _bg_index_pdf(job_id: str, filepath: Path, filename: str, machine_name: str):
+    """Process PDF page-by-page — low peak RAM."""
+    try:
+        total_chunks = 0
+        with pdfplumber.open(filepath) as pdf:
+            total_pages = len(pdf.pages)
+            for page_num, page in enumerate(pdf.pages, start=1):
+                _set_job(job_id, "indexing",
+                         f"Processing page {page_num}/{total_pages}...", total_chunks)
+
+                page_text = (page.extract_text() or "").strip()
+                if not page_text:
+                    page_text = _ocr_page(page).strip()
+                if not page_text:
+                    continue
+
+                chunks = _chunk(page_text)
+                if not chunks:
+                    continue
+
+                texts = chunks
+                metas = [{"machine_name": machine_name, "source_pdf": filename,
+                          "page_number": page_num, "source": "manual", "text": c}
+                         for c in chunks]
+
+                _embed_and_store(texts, metas)
+                total_chunks += len(chunks)
+
+                # Explicitly free page memory
+                del page_text, chunks, texts, metas
+
+        if total_chunks == 0:
+            filepath.unlink(missing_ok=True)
+            _set_job(job_id, "error", "No readable text found in PDF.")
+        else:
+            _set_job(job_id, "done", f"Indexed {filename}", total_chunks)
+            print(f"PDF indexed: {filename} → {total_chunks} chunks", flush=True)
+
+    except Exception as e:
+        filepath.unlink(missing_ok=True)
+        _set_job(job_id, "error", str(e))
+        print(f"PDF indexing error: {e}", flush=True)
+
+def _bg_index_excel(job_id: str, filepath: Path, filename: str,
+                    machine_name: str, original_filename: str):
+    try:
+        df = (pd.read_csv(filepath) if original_filename.lower().endswith(".csv")
+              else pd.read_excel(filepath))
+        df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+
+        texts, metas = [], []
+        for i, row in df.iterrows():
+            parts = [f"{k.replace('_',' ').title()}: {str(v).strip()}"
+                     for k, v in row.to_dict().items()
+                     if pd.notna(v) and str(v).strip()]
+            row_text = "\n".join(parts)
+            if not row_text.strip():
+                continue
+            texts.append(row_text)
+            metas.append({"machine_name": machine_name, "source_excel": filename,
+                          "log_id": f"row_{i}", "source": "repair_log", "text": row_text})
+
+        if not texts:
+            filepath.unlink(missing_ok=True)
+            _set_job(job_id, "error", "No data rows found in file.")
+            return
+
+        _embed_and_store(texts, metas)
+        _set_job(job_id, "done", f"Indexed {filename}", len(texts))
+        print(f"Excel indexed: {filename} → {len(texts)} rows", flush=True)
+
+    except Exception as e:
+        filepath.unlink(missing_ok=True)
+        _set_job(job_id, "error", str(e))
+        print(f"Excel indexing error: {e}", flush=True)
+
+# ── Retrieval ──────────────────────────────────────────────────────────────────
+def _retrieve(query: str, machine: str, top_manual=5, top_log=3):
+    with _index_lock:
+        if index.ntotal == 0:
+            return []
+        q_vec = embedder.encode([query])
+        k = min(index.ntotal, (top_manual + top_log) * 10)
+        scores, ids = index.search(np.array(q_vec, dtype="float32"), k)
+
     manual, logs = [], []
     for score, idx in zip(scores[0], ids[0]):
         if idx < 0 or idx not in metadata_store:
@@ -281,283 +299,106 @@ def _retrieve(query: str, machine: str, top_manual=5, top_log=3) -> list:
             continue
         row = {**meta, "score": round(float(score), 3)}
         if meta.get("source") == "repair_log":
-            if len(logs) < top_log:
-                logs.append(row)
+            if len(logs) < top_log: logs.append(row)
         else:
-            if len(manual) < top_manual:
-                manual.append(row)
+            if len(manual) < top_manual: manual.append(row)
         if len(manual) >= top_manual and len(logs) >= top_log:
             break
     return manual + logs
 
-def _get_machines() -> list:
+def _get_machines():
     return sorted(set(m["machine_name"] for m in metadata_store.values() if "machine_name" in m))
 
-def _get_files() -> list:
+def _get_files():
     files = {}
     for meta in metadata_store.values():
         key = meta.get("source_pdf") or meta.get("source_excel")
-        if not key:
-            continue
+        if not key: continue
         if key not in files:
             files[key] = {"filename": key, "machine": meta.get("machine_name", ""),
                           "type": "pdf" if meta.get("source_pdf") else "excel", "chunks": 0}
         files[key]["chunks"] += 1
     return list(files.values())
 
-# ── Job tracker ───────────────────────────────────────────────────────────────
-_jobs: dict = {}
-
-def _run_pdf_job(job_id: str, filepath: Path, filename: str, machine_name: str, replaced: int):
-    _jobs[job_id] = {"status": "processing", "chunks": 0, "replaced": replaced, "error": None}
-    try:
-        total_chunks = 0
-        print(f"PDF job {job_id}: opening {filepath}", flush=True)
-        with pdfplumber.open(filepath) as pdf:
-            total_pages = len(pdf.pages)
-            print(f"PDF job {job_id}: {total_pages} pages — embedding page by page...", flush=True)
-            for page_num, page in enumerate(pdf.pages, start=1):
-                try:
-                    page_text = (page.extract_text() or "").strip()
-
-                    # Extract tables — fault codes, spec tables, alarm lists
-                    tables = page.extract_tables()
-                    if tables:
-                        for table in tables:
-                            for row in table:
-                                row_text = " | ".join(
-                                    str(cell).strip() for cell in row
-                                    if cell and str(cell).strip()
-                                )
-                                if row_text:
-                                    page_text += "\n" + row_text
-
-                    if not page_text:
-                        page_text = _ocr_page(page).strip()
-                    if not page_text:
-                        continue
-
-                    page_chunk_dicts = _chunk(page_text)
-                    if not page_chunk_dicts:
-                        continue
-
-                    # For backward compatibility: _chunk may return strings or dicts
-                    if isinstance(page_chunk_dicts[0], dict):
-                        texts = [c["text"] for c in page_chunk_dicts]
-                        sections = [c.get("section", "") for c in page_chunk_dicts]
-                    else:
-                        texts = page_chunk_dicts
-                        sections = [""] * len(page_chunk_dicts)
-
-                    metas = [
-                        {
-                            "machine_name": machine_name,
-                            "source_pdf":   filename,
-                            "page_number":  page_num,
-                            "source":       "manual",
-                            "section":      sections[i],
-                            "text":         texts[i],
-                        }
-                        for i in range(len(texts))
-                    ]
-
-                    # Embed and save immediately — progress survives any restart
-                    _embed_and_store(texts, metas)
-                    total_chunks += len(texts)
-                    _jobs[job_id]["chunks"] = total_chunks
-
-                    if page_num % 10 == 0 or page_num == total_pages:
-                        print(f"PDF job {job_id}: page {page_num}/{total_pages}, "
-                              f"chunks: {total_chunks}", flush=True)
-
-                except Exception as page_err:
-                    print(f"PDF job {job_id}: ERROR page {page_num}: {page_err}", flush=True)
-                    continue
-
-        if total_chunks == 0:
-            filepath.unlink(missing_ok=True)
-            _jobs[job_id] = {"status": "error", "chunks": 0, "replaced": replaced,
-                             "error": "No readable text found in PDF."}
-            return
-
-        _jobs[job_id] = {"status": "done", "chunks": total_chunks, "replaced": replaced, "error": None}
-        print(f"PDF job {job_id}: DONE — {total_chunks} chunks stored.", flush=True)
-
-    except Exception as e:
-        import traceback
-        err_detail = traceback.format_exc()
-        print(f"PDF job {job_id}: FATAL ERROR — {e}\n{err_detail}", flush=True)
-        _jobs[job_id] = {"status": "error", "chunks": 0, "replaced": replaced, "error": str(e)}
-
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── FastAPI ────────────────────────────────────────────────────────────────────
 app = FastAPI(title="IndustrialRAG")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.middleware("http")
-async def force_cors(request, call_next):
-    if request.method == "OPTIONS":
-        return Response(status_code=200, headers={
-            "Access-Control-Allow-Origin":  "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Max-Age":       "86400",
-        })
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
-
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/pdfs", StaticFiles(directory=str(PDF_DIR)), name="pdfs")
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"status": "ok", "chunks_indexed": index.ntotal,
-            "embedder": "all-MiniLM-L6-v2-onnx" if embedder.session else "hash_fallback",
-            "machines": _get_machines()}
-
-@app.get("/admin/machines")
-def list_machines():
-    return {"machines": _get_machines()}
-
-@app.get("/admin/stats")
-def get_stats():
-    return {"total_chunks": index.ntotal, "machines": _get_machines(), "files": _get_files()}
-
-@app.get("/admin/job/{job_id}")
-def job_status(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, f"Job '{job_id}' not found")
-    return job
-
-@app.post("/admin/upload/pdf")
-async def upload_pdf(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    machine_name: str = Form(...),
-):
+@app.post("/admin/upload/pdf", status_code=202)
+async def upload_pdf(file: UploadFile = File(...), machine_name: str = Form(...)):
     machine_name = machine_name.strip()
-    if not machine_name:
-        raise HTTPException(400, "machine_name is required")
-    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', machine_name)
-    safe_file = re.sub(r'[^a-zA-Z0-9_.-]', '_', file.filename)
-    filename  = f"{safe_name}_{safe_file}"
+    if not machine_name: raise HTTPException(400, "machine_name is required")
+    safe_name = machine_name.replace(" ", "_")
+    filename  = f"{safe_name}_{file.filename}"
     filepath  = PDF_DIR / filename
     data      = await file.read()
-    if not data:
-        raise HTTPException(400, "Uploaded file is empty")
-    replaced = _remove_by_source(source_pdf=filename)
+    _remove_by_source(source_pdf=filename)
     filepath.write_bytes(data)
-    job_id = f"job_{int(time.time() * 1000)}_{safe_name}"
-    background_tasks.add_task(_run_pdf_job, job_id, filepath, filename, machine_name, replaced)
-    print(f"PDF upload queued: {filename} → {job_id}", flush=True)
-    return {"status": "processing", "job_id": job_id, "machine": machine_name,
-            "filename": filename, "message": "Polling /admin/job/{job_id} for status."}
+    del data  # free RAM immediately
 
-@app.post("/admin/upload/excel")
+    job_id = str(uuid.uuid4())
+    _set_job(job_id, "indexing", "Starting PDF indexing...")
+    t = threading.Thread(target=_bg_index_pdf,
+                         args=(job_id, filepath, filename, machine_name), daemon=True)
+    t.start()
+    return {"job_id": job_id, "filename": filename, "status": "indexing"}
+
+@app.post("/admin/upload/excel", status_code=202)
 async def upload_excel(file: UploadFile = File(...), machine_name: str = Form(...)):
     machine_name = machine_name.strip()
-    if not machine_name:
-        raise HTTPException(400, "machine_name is required")
-    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', machine_name)
-    safe_file = re.sub(r'[^a-zA-Z0-9_.-]', '_', file.filename)
-    filename  = f"{safe_name}_{safe_file}"
+    if not machine_name: raise HTTPException(400, "machine_name is required")
+    safe_name = machine_name.replace(" ", "_")
+    filename  = f"{safe_name}_{file.filename}"
     filepath  = EXCEL_DIR / filename
     data      = await file.read()
-    replaced  = _remove_by_source(source_excel=filename)
+    _remove_by_source(source_excel=filename)
     filepath.write_bytes(data)
-    try:
-        df = pd.read_csv(filepath) if file.filename.lower().endswith(".csv") else pd.read_excel(filepath)
-        df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    except Exception as e:
-        filepath.unlink(missing_ok=True)
-        raise HTTPException(500, f"File parsing failed: {e}")
-    texts, metas = [], []
-    for i, row in df.iterrows():
-        parts = [f"{k.replace('_',' ').title()}: {str(v).strip()}"
-                 for k, v in row.to_dict().items() if pd.notna(v) and str(v).strip()]
-        row_text = "\n".join(parts)
-        if not row_text.strip():
-            continue
-        texts.append(row_text)
-        metas.append({"machine_name": machine_name, "source_excel": filename,
-                      "log_id": f"row_{i}", "source": "repair_log", "text": row_text})
-    if not texts:
-        filepath.unlink(missing_ok=True)
-        raise HTTPException(422, "No data rows found in file.")
-    _embed_and_store(texts, metas)
-    return {"status": "success", "machine": machine_name, "filename": filename,
-            "rows_stored": len(texts), "old_rows_replaced": replaced}
+    del data
 
-@app.delete("/admin/delete/pdf/{filename:path}")
+    job_id = str(uuid.uuid4())
+    _set_job(job_id, "indexing", "Starting Excel indexing...")
+    t = threading.Thread(target=_bg_index_excel,
+                         args=(job_id, filepath, filename, machine_name, file.filename), daemon=True)
+    t.start()
+    return {"job_id": job_id, "filename": filename, "status": "indexing"}
+
+@app.get("/admin/job/{job_id}")
+def get_job(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
+
+@app.delete("/admin/delete/pdf/{filename}")
 def delete_pdf(filename: str):
-    removed = _remove_by_source(source_pdf=filename)
+    removed  = _remove_by_source(source_pdf=filename)
     filepath = PDF_DIR / filename
-    existed = filepath.exists()
-    if existed:
-        filepath.unlink()
+    existed  = filepath.exists()
+    if existed: filepath.unlink()
     if removed == 0 and not existed:
         raise HTTPException(404, f"'{filename}' not found")
     return {"status": "deleted", "filename": filename, "chunks_removed": removed}
 
-@app.delete("/admin/delete/excel/{filename:path}")
+@app.delete("/admin/delete/excel/{filename}")
 def delete_excel(filename: str):
-    removed = _remove_by_source(source_excel=filename)
+    removed  = _remove_by_source(source_excel=filename)
     filepath = EXCEL_DIR / filename
-    existed = filepath.exists()
-    if existed:
-        filepath.unlink()
+    existed  = filepath.exists()
+    if existed: filepath.unlink()
     if removed == 0 and not existed:
         raise HTTPException(404, f"'{filename}' not found")
     return {"status": "deleted", "filename": filename, "chunks_removed": removed}
-
-
-@app.post("/admin/test-pdf-parse")
-async def test_pdf_parse(file: UploadFile = File(...)):
-    """Debug endpoint: returns first 3 pages text extraction WITHOUT embedding."""
-    import io
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "Empty file")
-    results = []
-    try:
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            total = len(pdf.pages)
-            for i, page in enumerate(pdf.pages[:5]):  # first 5 pages only
-                raw = (page.extract_text() or "").strip()
-                ocr_text = ""
-                if not raw:
-                    ocr_text = _ocr_page(page).strip()
-                results.append({
-                    "page": i+1,
-                    "pdfplumber_chars": len(raw),
-                    "ocr_chars": len(ocr_text),
-                    "sample": (raw or ocr_text)[:200],
-                })
-    except Exception as e:
-        raise HTTPException(500, f"PDF parse error: {e}")
-    return {"total_pages": total, "pages_sampled": len(results), "results": results}
 
 @app.delete("/admin/reset")
 def reset_all():
     global index, metadata_store, _id_counter
     with _index_lock:
-        index = _make_index()
-        metadata_store = {}
-        _id_counter = 0
+        index = _make_index(); metadata_store = {}; _id_counter = 0
         _save()
     for d in [PDF_DIR, EXCEL_DIR]:
-        shutil.rmtree(d, ignore_errors=True)
-        d.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True, exist_ok=True)
     return {"status": "reset complete"}
 
 class QueryRequest(BaseModel):
@@ -566,23 +407,19 @@ class QueryRequest(BaseModel):
 
 @app.post("/query")
 async def query_system(req: QueryRequest):
-    if not req.query.strip():
-        raise HTTPException(400, "Query cannot be empty")
-    if index.ntotal == 0:
-        raise HTTPException(404, "No documents indexed yet. Upload a PDF first.")
+    if not req.query.strip(): raise HTTPException(400, "Query cannot be empty")
     machines = _get_machines() if req.machine_name.lower() == "all" else [req.machine_name]
-    if not machines:
-        raise HTTPException(404, "No machines in knowledge base")
+    if not machines: raise HTTPException(404, "No machines in knowledge base")
     results = []
     for machine in machines:
         chunks = _retrieve(req.query, machine)
-        if not chunks:
-            continue
+        if not chunks: continue
         manual_chunks = [c for c in chunks if c.get("source") == "manual"]
         log_chunks    = [c for c in chunks if c.get("source") == "repair_log"]
         context_parts, references, seen_refs = [], [], set()
         for c in manual_chunks:
-            context_parts.append(f"[MANUAL - Page {c.get('page_number','?')} | {c.get('source_pdf','')}]\n{c['text']}")
+            context_parts.append(
+                f"[MANUAL - Page {c.get('page_number','?')} | {c.get('source_pdf','')}]\n{c['text']}")
             key = f"{c.get('source_pdf','')}:{c.get('page_number',1)}"
             if key not in seen_refs:
                 seen_refs.add(key)
@@ -594,7 +431,7 @@ async def query_system(req: QueryRequest):
             "context": "\n\n---\n\n".join(context_parts),
             "references": references,
             "manual_chunks_used": len(manual_chunks),
-            "log_chunks_used":    len(log_chunks),
+            "log_chunks_used": len(log_chunks),
             "_chunks": [{"text": c.get("text","")[:400], "score": c.get("score",0),
                          "source": c.get("source","manual"), "page_number": c.get("page_number"),
                          "source_pdf": c.get("source_pdf","")} for c in chunks],
@@ -610,24 +447,20 @@ class FormatRequest(BaseModel):
 async def format_response(req: FormatRequest):
     return {"formatted": generate_formatted_response(req.context, req.query, req.machine)}
 
-@app.get("/pdf/{filename:path}")
+@app.get("/admin/machines")
+def list_machines():
+    return {"machines": _get_machines()}
+
+@app.get("/admin/stats")
+def get_stats():
+    return {"total_chunks": index.ntotal, "machines": _get_machines(), "files": _get_files()}
+
+@app.get("/pdf/{filename}")
 def serve_pdf(filename: str):
     filepath = PDF_DIR / filename
-    if not filepath.exists():
-        raise HTTPException(404, "PDF not found")
+    if not filepath.exists(): raise HTTPException(404, "PDF not found")
     return FileResponse(str(filepath), media_type="application/pdf")
 
-# ── Keep-alive ────────────────────────────────────────────────────────────────
-def _keep_alive():
-    url = os.environ.get("RENDER_EXTERNAL_URL", "")
-    if not url:
-        return
-    while True:
-        time.sleep(840)
-        try:
-            requests.get(f"{url}/health", timeout=10)
-            print("Keep-alive ping sent.", flush=True)
-        except Exception:
-            pass
-
-threading.Thread(target=_keep_alive, daemon=True).start()
+@app.get("/health")
+def health():
+    return {"status": "ok", "chunks_indexed": index.ntotal, "embedder": "gemini-embedding-001"}
