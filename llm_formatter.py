@@ -58,7 +58,37 @@ def _is_bad(text: str) -> bool:
     return False
 
 
-# ── 1. Gemini Flash — PRIMARY (free, same key as embeddings) ──────────────────
+# ── 1. Groq — PRIMARY (free, ultra-fast) ─────────────────────────────────────
+def _groq(context: str, query: str, machine: str) -> Optional[str]:
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print("LLM: GROQ_API_KEY not set, skipping.", flush=True)
+        return None
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": _build_prompt(context, query, machine)}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 1500
+            },
+            timeout=30
+        )
+        resp.raise_for_status()
+        result = resp.json()["choices"][0]["message"]["content"]
+        print(f"LLM: Groq returned {len(result)} chars.", flush=True)
+        return result
+    except Exception as e:
+        print(f"LLM: Groq error: {e}", flush=True)
+    return None
+
+
+# ── 2. Gemini Flash — fallback ─────────────────────────────────────────────────
 def _gemini(context: str, query: str, machine: str) -> Optional[str]:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -72,14 +102,13 @@ def _gemini(context: str, query: str, machine: str) -> Optional[str]:
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1500}
     }
 
-    # Retry up to 4 times with increasing delay on 429
     for attempt in range(4):
         try:
             resp = requests.post(
                 url, params={"key": api_key}, json=payload, timeout=30
             )
             if resp.status_code == 429:
-                wait = 15 * (attempt + 1)  # 15s, 30s, 45s, 60s
+                wait = 15 * (attempt + 1)
                 print(f"LLM: Gemini 429 rate limit, waiting {wait}s (attempt {attempt+1}/4)...", flush=True)
                 time.sleep(wait)
                 continue
@@ -97,7 +126,7 @@ def _gemini(context: str, query: str, machine: str) -> Optional[str]:
     return None
 
 
-# ── 2. Anthropic (Claude Haiku) — fallback if credits available ───────────────
+# ── 3. Anthropic (Claude Haiku) — fallback if credits available ───────────────
 def _anthropic(context: str, query: str, machine: str) -> Optional[str]:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -119,7 +148,7 @@ def _anthropic(context: str, query: str, machine: str) -> Optional[str]:
     return None
 
 
-# ── 3. OpenAI ─────────────────────────────────────────────────────────────────
+# ── 4. OpenAI ─────────────────────────────────────────────────────────────────
 def _openai(context: str, query: str, machine: str) -> Optional[str]:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -144,7 +173,7 @@ def _openai(context: str, query: str, machine: str) -> Optional[str]:
     return None
 
 
-# ── 4. Ollama (local only) ────────────────────────────────────────────────────
+# ── 5. Ollama (local only) ────────────────────────────────────────────────────
 def _ollama(context: str, query: str, machine: str) -> Optional[str]:
     if os.environ.get("USE_OLLAMA", "false").lower() != "true":
         return None
@@ -167,7 +196,7 @@ def _ollama(context: str, query: str, machine: str) -> Optional[str]:
     return None
 
 
-# ── 5. Rule-based fallback ────────────────────────────────────────────────────
+# ── 6. Rule-based fallback ────────────────────────────────────────────────────
 def _rule_based(context: str, query: str) -> str:
     print("LLM: Using rule-based fallback.", flush=True)
     sentences = [
@@ -224,7 +253,7 @@ def generate_formatted_response(context: str, query: str, machine: str) -> str:
             "Do not attempt repairs without the official manual."
         )
 
-    for fn in [_gemini, _anthropic, _openai, _ollama]:
+    for fn in [_groq, _gemini, _anthropic, _openai, _ollama]:
         result = fn(context, query, machine)
         if result and not _is_bad(result):
             return result
